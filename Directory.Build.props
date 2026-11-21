@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <NuGetAudit>false</NuGetAudit>
+    <RestoreBuildInParallel>false</RestoreBuildInParallel>
+    <BuildInParallel>false</BuildInParallel>
+    <SatelliteResourceLanguages>none</SatelliteResourceLanguages>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+</Project>
