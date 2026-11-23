@@ -48,6 +48,7 @@ public sealed class PngJpegFigureExtractor(
         Directory.CreateDirectory(outputDirectory);
 
         var results = new List<ExtractedFigureArtifact>(figures.Count);
+        var usedFileNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var figure in figures)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -125,14 +126,15 @@ public sealed class PngJpegFigureExtractor(
             }
 
             string ext = options.Format == "jpg" ? "jpg" : "png";
-            string imagePath = Path.Combine(outputDirectory, $"{figure.Id}.{ext}");
+            string baseStem = ResolveUniqueFileStem(figure, options.NamingMode, usedFileNames);
+            string imagePath = Path.Combine(outputDirectory, $"{baseStem}.{ext}");
             string? metaPath = null;
             byte[] encodedBytes = EncodeBitmap(bitmap, options.Format, options.Dpi, options.Quality);
             await File.WriteAllBytesAsync(imagePath, encodedBytes, cancellationToken);
 
             if (options.IncludeMetadata)
             {
-                metaPath = Path.Combine(outputDirectory, $"{figure.Id}.meta.json");
+                metaPath = Path.Combine(outputDirectory, $"{baseStem}.meta.json");
                 var metadata = new FigureSidecarMetadata(
                     figure.Id,
                     document.Id,
@@ -144,6 +146,8 @@ public sealed class PngJpegFigureExtractor(
                     DocumentFigure.FormatSourceTag(figure.Source),
                     bitmap.RenderEngine,
                     figure.Label,
+                    figure.VocabPrefix,
+                    figure.FigureNumber,
                     figure.Caption,
                     options.IncludeCaption && figure.CaptionBoundingBox is not null,
                     figure.BoundingBox,
@@ -180,10 +184,85 @@ public sealed class PngJpegFigureExtractor(
                 options.IncludeCaption && figure.CaptionBoundingBox is not null,
                 bitmap.RenderEngine,
                 appliedInfos,
-                options.Quality));
+                options.Quality,
+                figure.FigureNumber,
+                figure.Label,
+                figure.Caption,
+                figure.Confidence,
+                figure.Category.ToString().ToLowerInvariant()));
         }
 
         return Result<IReadOnlyList<ExtractedFigureArtifact>>.Success(results);
+    }
+
+    public async Task<Result<string>> WriteManifestAsync(
+        PdfDocument document,
+        IReadOnlyList<ExtractedFigureArtifact> artifacts,
+        string outputDirectory,
+        CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        string manifestPath = Path.Combine(outputDirectory, "manifest.json");
+        string cwd = Directory.GetCurrentDirectory();
+        string fullOutDir = Path.GetFullPath(outputDirectory);
+        string relOutDir = MakeRelativeForwardPath(cwd, fullOutDir);
+
+        var entries = new Dictionary<string, FigureManifestEntry>(StringComparer.OrdinalIgnoreCase);
+        foreach (var art in artifacts)
+        {
+            string baseKey = !string.IsNullOrWhiteSpace(art.FigureNumber) ? art.FigureNumber! : art.FigureId;
+            string key = baseKey;
+            if (entries.ContainsKey(key))
+            {
+                key = $"{baseKey}_i{art.Index}";
+                int suffix = 2;
+                while (entries.ContainsKey(key))
+                    key = $"{baseKey}_i{art.Index}_{suffix++}";
+            }
+
+            string fullImgPath = Path.GetFullPath(art.OutputImagePath);
+            string relImgPath = MakeRelativeForwardPath(cwd, fullImgPath);
+            string fileName = Path.GetFileName(fullImgPath);
+            var fig = document.FindFigure(art.FigureId);
+
+            entries[key] = new FigureManifestEntry(
+                art.FigureId,
+                art.FigureNumber ?? fig?.FigureNumber,
+                art.PageNumber,
+                art.Category ?? fig?.Category.ToString().ToLowerInvariant() ?? "figure",
+                art.Label ?? fig?.Label,
+                art.Caption ?? fig?.Caption,
+                art.Confidence > 0 ? art.Confidence : (fig?.Confidence ?? 0),
+                relImgPath,
+                fileName,
+                art.PixelWidth,
+                art.PixelHeight);
+        }
+
+        var manifest = new FigureManifestDocument(
+            document.Id,
+            TimeProvider.System.GetUtcNow(),
+            relOutDir,
+            entries);
+
+        string json = JsonSerializer.Serialize(manifest, FigureManifestJsonContext.Default.FigureManifestDocument);
+        await File.WriteAllTextAsync(manifestPath, json, cancellationToken);
+        return manifestPath;
+    }
+
+    private static string MakeRelativeForwardPath(string baseDir, string targetPath)
+    {
+        try
+        {
+            string normBase = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            string normTarget = Path.GetFullPath(targetPath);
+            if (normTarget.StartsWith(normBase, StringComparison.OrdinalIgnoreCase))
+                return Path.GetRelativePath(normBase, normTarget).Replace('\\', '/');
+        }
+        catch
+        {
+        }
+        return targetPath.Replace('\\', '/');
     }
 
     public async Task<Result<IReadOnlyList<RenderedPageArtifact>>> ExportPagesAsync(
@@ -318,6 +397,33 @@ public sealed class PngJpegFigureExtractor(
         }
 
         return list;
+    }
+
+    private static string ResolveUniqueFileStem(DocumentFigure figure, string namingMode, HashSet<string> usedFileNames)
+    {
+        string baseStem;
+        if (string.Equals(namingMode, "id", StringComparison.OrdinalIgnoreCase))
+        {
+            baseStem = figure.Id;
+        }
+        else
+        {
+            string safeNum = FigureNumberNormalizer.SanitizeForFileName(figure.FigureNumber);
+            baseStem = !string.IsNullOrWhiteSpace(safeNum)
+                ? $"fig_{safeNum}"
+                : $"fig_p{figure.PageNumber}_i{figure.Index}";
+        }
+
+        string candidate = baseStem;
+        if (!usedFileNames.Add(candidate))
+        {
+            candidate = $"{baseStem}_i{figure.Index}";
+            int suffix = 2;
+            while (!usedFileNames.Add(candidate))
+                candidate = $"{baseStem}_i{figure.Index}_{suffix++}";
+        }
+
+        return candidate;
     }
 
     private static byte[] EncodeBitmap(RenderedRgbBitmap bmp, string format, int dpi, int quality) =>

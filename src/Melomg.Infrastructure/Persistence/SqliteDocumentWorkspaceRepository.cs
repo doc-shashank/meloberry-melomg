@@ -1,6 +1,8 @@
 using System.Globalization;
+using System.Text.Json;
 using Melomg.Application.Abstractions;
 using Melomg.Domain.Documents;
+using Melomg.Infrastructure.Serialization;
 using Microsoft.Data.Sqlite;
 
 namespace Melomg.Infrastructure.Persistence;
@@ -38,8 +40,9 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 """
                 INSERT INTO DocumentMeta (
                     Id, Title, SourcePdfPath, StoredPdfPath, Sha256Hash, ModelName, ConfidenceThreshold,
-                    IngestedAtUtc, ActiveFigureId, WorkspaceMode, RetainDatabase
-                ) VALUES ($id, $title, $src, $stored, $sha, $model, $conf, $ts, $active, $mode, $retain);
+                    IngestedAtUtc, ActiveFigureId, WorkspaceMode, RetainDatabase,
+                    VocabPrimaryPrefix, VocabPrefixesJson, VocabNumberingStyle
+                ) VALUES ($id, $title, $src, $stored, $sha, $model, $conf, $ts, $active, $mode, $retain, $vp, $vps, $vs);
                 """,
                 cancellationToken,
                 ("$id", document.Id), ("$title", document.Title), ("$src", document.SourcePdfPath),
@@ -47,7 +50,10 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 ("$conf", document.ConfidenceThreshold), ("$ts", document.IngestedAtUtc.ToString("O")),
                 ("$active", document.ActiveFigureId),
                 ("$mode", document.Mode == WorkspaceMode.Project ? "project" : "standard"),
-                ("$retain", document.RetainDatabase ? 1 : 0));
+                ("$retain", document.RetainDatabase ? 1 : 0),
+                ("$vp", document.Vocabulary.PrimaryPrefix),
+                ("$vps", JsonSerializer.Serialize(document.Vocabulary.DetectedPrefixes, ModelSettingsJsonContext.Default.IReadOnlyListString)),
+                ("$vs", document.Vocabulary.NumberingStyle));
 
             foreach (var p in document.Pages)
             {
@@ -66,8 +72,9 @@ public sealed class SqliteDocumentWorkspaceRepository(
                     INSERT INTO DocumentFigures (
                         Id, SortIndex, PageNumber, PageFigureIndex, Category, BboxX, BboxY, BboxW, BboxH,
                         Confidence, Caption, Label, Source, LastExtractedPath,
-                        CaptionBboxX, CaptionBboxY, CaptionBboxW, CaptionBboxH
-                    ) VALUES ($id, $idx, $page, $pidx, $cat, $x, $y, $w, $h, $conf, $cap, $lbl, $src, $ext, $cx, $cy, $cw, $ch);
+                        CaptionBboxX, CaptionBboxY, CaptionBboxW, CaptionBboxH,
+                        VocabPrefix, FigureNumber, NormalizedNumber
+                    ) VALUES ($id, $idx, $page, $pidx, $cat, $x, $y, $w, $h, $conf, $cap, $lbl, $src, $ext, $cx, $cy, $cw, $ch, $vpref, $fnum, $nn);
                     """,
                     cancellationToken,
                     ("$id", f.Id), ("$idx", f.Index), ("$page", f.PageNumber), ("$pidx", f.PageFigureIndex),
@@ -75,7 +82,8 @@ public sealed class SqliteDocumentWorkspaceRepository(
                     ("$w", f.BoundingBox.Width), ("$h", f.BoundingBox.Height), ("$conf", f.Confidence),
                     ("$cap", f.Caption), ("$lbl", f.Label), ("$src", DocumentFigure.FormatSourceTag(f.Source)),
                     ("$ext", f.LastExtractedPath), ("$cx", f.CaptionBoundingBox?.X), ("$cy", f.CaptionBoundingBox?.Y),
-                    ("$cw", f.CaptionBoundingBox?.Width), ("$ch", f.CaptionBoundingBox?.Height));
+                    ("$cw", f.CaptionBoundingBox?.Width), ("$ch", f.CaptionBoundingBox?.Height),
+                    ("$vpref", f.VocabPrefix), ("$fnum", f.FigureNumber), ("$nn", f.NormalizedNumber));
 
                 foreach (var m in f.LabelMasks)
                 {
@@ -145,7 +153,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
             await using var cmd = conn.CreateCommand();
             cmd.CommandText =
                 """
-                SELECT DocumentId, Title, PageCount, FigureCount, ModelName, ConfidenceThreshold, DbPath, StorageDirectory, IngestedAtUtc, WorkspaceMode
+                SELECT DocumentId, Title, PageCount, FigureCount, ModelName, ConfidenceThreshold, DbPath, StorageDirectory, IngestedAtUtc, WorkspaceMode, VocabPrimaryPrefix
                 FROM DocumentRegistry
                 ORDER BY IngestedAtUtc DESC;
                 """;
@@ -169,10 +177,11 @@ public sealed class SqliteDocumentWorkspaceRepository(
                     ? dt
                     : DateTimeOffset.MinValue;
                 string modeStr = reader.IsDBNull(9) ? "standard" : reader.GetString(9);
+                string? vocabPrimary = reader.IsDBNull(10) ? null : reader.GetString(10);
 
                 items.Add(new DocumentListItem(
                     docId, reader.GetString(1), reader.GetInt32(2), reader.GetInt32(3),
-                    reader.GetString(4), reader.GetDouble(5), storageDir, ingestedAt, modeStr));
+                    reader.GetString(4), reader.GetDouble(5), storageDir, ingestedAt, modeStr, vocabPrimary));
             }
         }
 
@@ -359,6 +368,14 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await TryRegisterDirAsync(rootDir);
         foreach (var subDir in Directory.EnumerateDirectories(rootDir))
             await TryRegisterDirAsync(subDir);
+
+        string meloberryMelomgRoot = Path.Combine(rootDir, ".meloberry", "melomg");
+        if (Directory.Exists(meloberryMelomgRoot))
+        {
+            await TryRegisterDirAsync(meloberryMelomgRoot);
+            foreach (var subDir in Directory.EnumerateDirectories(meloberryMelomgRoot))
+                await TryRegisterDirAsync(subDir);
+        }
     }
 
     private async Task RegisterDocumentAsync(PdfDocument document, string dbPath, CancellationToken cancellationToken)
@@ -372,21 +389,23 @@ public sealed class SqliteDocumentWorkspaceRepository(
             conn, tx,
             """
             INSERT INTO DocumentRegistry (
-                DocumentId, Title, PageCount, FigureCount, ModelName, ConfidenceThreshold, DbPath, StorageDirectory, IngestedAtUtc, WorkspaceMode
+                DocumentId, Title, PageCount, FigureCount, ModelName, ConfidenceThreshold, DbPath, StorageDirectory, IngestedAtUtc, WorkspaceMode, VocabPrimaryPrefix
             )
-            VALUES ($id, $title, $pages, $figs, $model, $conf, $db, $dir, $ts, $mode)
+            VALUES ($id, $title, $pages, $figs, $model, $conf, $db, $dir, $ts, $mode, $vp)
             ON CONFLICT(DocumentId) DO UPDATE SET
                 Title = excluded.Title, PageCount = excluded.PageCount, FigureCount = excluded.FigureCount,
                 ModelName = excluded.ModelName, ConfidenceThreshold = excluded.ConfidenceThreshold,
                 DbPath = excluded.DbPath, StorageDirectory = excluded.StorageDirectory,
-                IngestedAtUtc = excluded.IngestedAtUtc, WorkspaceMode = excluded.WorkspaceMode;
+                IngestedAtUtc = excluded.IngestedAtUtc, WorkspaceMode = excluded.WorkspaceMode,
+                VocabPrimaryPrefix = excluded.VocabPrimaryPrefix;
             """,
             cancellationToken,
             ("$id", document.Id), ("$title", document.Title), ("$pages", document.PageCount),
             ("$figs", document.Figures.Count), ("$model", document.ModelName),
             ("$conf", document.ConfidenceThreshold), ("$db", dbPath), ("$dir", document.WorkingDirectory),
             ("$ts", document.IngestedAtUtc.ToString("O")),
-            ("$mode", document.Mode == WorkspaceMode.Project ? "project" : "standard"));
+            ("$mode", document.Mode == WorkspaceMode.Project ? "project" : "standard"),
+            ("$vp", document.Vocabulary.PrimaryPrefix));
 
         await SqliteModelSettingsRepository.ExecuteNonQueryAsync(
             conn, tx, "DELETE FROM FigureEntityIndex WHERE DocumentId = $docId;", cancellationToken, ("$docId", document.Id));
@@ -416,6 +435,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 if (await checkCmd.ExecuteScalarAsync(cancellationToken) is null or DBNull) return null;
             }
 
+            await EnsureColumnsAsyncCompat(conn, cancellationToken);
             return await LoadDocumentFromOpenConnectionAsync(conn, storageDirectory, cancellationToken);
         }
         catch (Exception ex) when (ex is SqliteException or IOException or UnauthorizedAccessException)
@@ -433,11 +453,12 @@ public sealed class SqliteDocumentWorkspaceRepository(
         string? activeFigId;
         WorkspaceMode workspaceMode;
         bool retainDatabase;
+        List<string> scannedVocabPrefixes = [];
 
         await using (var metaCmd = conn.CreateCommand())
         {
             metaCmd.CommandText =
-                "SELECT Id, Title, SourcePdfPath, StoredPdfPath, Sha256Hash, ModelName, ConfidenceThreshold, IngestedAtUtc, ActiveFigureId, WorkspaceMode, RetainDatabase FROM DocumentMeta LIMIT 1;";
+                "SELECT Id, Title, SourcePdfPath, StoredPdfPath, Sha256Hash, ModelName, ConfidenceThreshold, IngestedAtUtc, ActiveFigureId, WorkspaceMode, RetainDatabase, VocabPrimaryPrefix, VocabPrefixesJson FROM DocumentMeta LIMIT 1;";
             await using var reader = await metaCmd.ExecuteReaderAsync(cancellationToken);
             if (!await reader.ReadAsync(cancellationToken)) return null;
 
@@ -462,6 +483,19 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 ? WorkspaceMode.Project
                 : WorkspaceMode.Standard;
             retainDatabase = !reader.IsDBNull(10) && reader.GetInt32(10) != 0;
+
+            if (!reader.IsDBNull(12))
+            {
+                try
+                {
+                    var parsedPrefixes = JsonSerializer.Deserialize(reader.GetString(12), ModelSettingsJsonContext.Default.ListString);
+                    if (parsedPrefixes is { Count: > 0 })
+                        scannedVocabPrefixes.AddRange(parsedPrefixes);
+                }
+                catch { }
+            }
+            if (scannedVocabPrefixes.Count == 0 && !reader.IsDBNull(11) && !string.IsNullOrWhiteSpace(reader.GetString(11)))
+                scannedVocabPrefixes.Add(reader.GetString(11));
         }
 
         var pages = new List<PdfPageInfo>();
@@ -500,14 +534,18 @@ public sealed class SqliteDocumentWorkspaceRepository(
             figsCmd.CommandText =
                 """
                 SELECT Id, SortIndex, PageNumber, PageFigureIndex, Category, BboxX, BboxY, BboxW, BboxH,
-                       Confidence, Caption, Label, Source, LastExtractedPath, CaptionBboxX, CaptionBboxY, CaptionBboxW, CaptionBboxH
+                       Confidence, Caption, Label, Source, LastExtractedPath, CaptionBboxX, CaptionBboxY, CaptionBboxW, CaptionBboxH,
+                       VocabPrefix, FigureNumber, NormalizedNumber
                 FROM DocumentFigures ORDER BY SortIndex ASC;
                 """;
             await using var reader = await figsCmd.ExecuteReaderAsync(cancellationToken);
             while (await reader.ReadAsync(cancellationToken))
             {
+                // Skip legacy non-image/diagram rows (e.g., table, formula) structurally
+                if (!DocumentFigure.TryParseCategory(reader.GetString(4), out var category))
+                    continue;
+
                 string figId = reader.GetString(0);
-                DocumentFigure.TryParseCategory(reader.GetString(4), out var category);
                 DocumentFigure.TryParseDetectionSource(reader.GetString(12), out var source);
                 var bbox = new BoundingBox(reader.GetDouble(5), reader.GetDouble(6), reader.GetDouble(7), reader.GetDouble(8));
                 BoundingBox? captionBox = !reader.IsDBNull(14) && !reader.IsDBNull(15) && !reader.IsDBNull(16) && !reader.IsDBNull(17)
@@ -518,16 +556,36 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 figures.Add(DocumentFigure.Rehydrate(
                     figId, id, reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3), category, bbox,
                     reader.GetDouble(9), reader.IsDBNull(10) ? null : reader.GetString(10), reader.GetString(11),
-                    source, reader.IsDBNull(13) ? null : reader.GetString(13), captionBox, figMasks));
+                    source, reader.IsDBNull(13) ? null : reader.GetString(13), captionBox, figMasks,
+                    reader.IsDBNull(18) ? null : reader.GetString(18),
+                    reader.IsDBNull(19) ? null : reader.GetString(19),
+                    reader.IsDBNull(20) ? null : reader.GetString(20)));
             }
         }
 
         return PdfDocument.Rehydrate(
             id, title, sourcePdf, storedPdf, sha256, storageDirectory, modelName, conf,
-            ingestedAt, activeFigId, pages, figures, workspaceMode, retainDatabase);
+            ingestedAt, activeFigId, pages, figures, workspaceMode, retainDatabase, scannedVocabPrefixes);
     }
 
     private static SqliteConnection OpenWorkspaceConnection(string dbPath) => new($"Data Source={dbPath};Pooling=False");
+
+    private static async Task EnsureColumnsAsyncCompat(SqliteConnection conn, CancellationToken cancellationToken)
+    {
+        await SqliteModelSettingsRepository.EnsureColumnsAsync(conn, "DocumentMeta", [
+            ("WorkspaceMode", "TEXT NOT NULL DEFAULT 'standard'"),
+            ("RetainDatabase", "INTEGER NOT NULL DEFAULT 0"),
+            ("VocabPrimaryPrefix", "TEXT NULL"),
+            ("VocabPrefixesJson", "TEXT NULL"),
+            ("VocabNumberingStyle", "TEXT NOT NULL DEFAULT 'none'")
+        ], cancellationToken);
+
+        await SqliteModelSettingsRepository.EnsureColumnsAsync(conn, "DocumentFigures", [
+            ("CaptionBboxX", "REAL NULL"), ("CaptionBboxY", "REAL NULL"),
+            ("CaptionBboxW", "REAL NULL"), ("CaptionBboxH", "REAL NULL"),
+            ("VocabPrefix", "TEXT NULL"), ("FigureNumber", "TEXT NULL"), ("NormalizedNumber", "TEXT NULL")
+        ], cancellationToken);
+    }
 
     private static async Task EnsureWorkspaceSchemaAsync(SqliteConnection conn, CancellationToken cancellationToken)
     {
@@ -538,7 +596,8 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 Id TEXT PRIMARY KEY, Title TEXT NOT NULL, SourcePdfPath TEXT NOT NULL, StoredPdfPath TEXT NOT NULL,
                 Sha256Hash TEXT NOT NULL, ModelName TEXT NOT NULL, ConfidenceThreshold REAL NOT NULL,
                 IngestedAtUtc TEXT NOT NULL, ActiveFigureId TEXT NULL,
-                WorkspaceMode TEXT NOT NULL DEFAULT 'standard', RetainDatabase INTEGER NOT NULL DEFAULT 0
+                WorkspaceMode TEXT NOT NULL DEFAULT 'standard', RetainDatabase INTEGER NOT NULL DEFAULT 0,
+                VocabPrimaryPrefix TEXT NULL, VocabPrefixesJson TEXT NULL, VocabNumberingStyle TEXT NOT NULL DEFAULT 'none'
             );
             CREATE TABLE IF NOT EXISTS DocumentPages (
                 PageNumber INTEGER PRIMARY KEY, WidthPts REAL NOT NULL, HeightPts REAL NOT NULL, RotationDegrees INTEGER NOT NULL
@@ -547,7 +606,8 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 Id TEXT PRIMARY KEY, SortIndex INTEGER NOT NULL, PageNumber INTEGER NOT NULL, PageFigureIndex INTEGER NOT NULL,
                 Category TEXT NOT NULL, BboxX REAL NOT NULL, BboxY REAL NOT NULL, BboxW REAL NOT NULL, BboxH REAL NOT NULL,
                 Confidence REAL NOT NULL, Caption TEXT NULL, Label TEXT NOT NULL, Source TEXT NOT NULL, LastExtractedPath TEXT NULL,
-                CaptionBboxX REAL NULL, CaptionBboxY REAL NULL, CaptionBboxW REAL NULL, CaptionBboxH REAL NULL
+                CaptionBboxX REAL NULL, CaptionBboxY REAL NULL, CaptionBboxW REAL NULL, CaptionBboxH REAL NULL,
+                VocabPrefix TEXT NULL, FigureNumber TEXT NULL, NormalizedNumber TEXT NULL
             );
             CREATE TABLE IF NOT EXISTS DocumentFigureMasks (
                 FigureId TEXT NOT NULL, MaskIndex INTEGER NOT NULL, BboxX REAL NOT NULL, BboxY REAL NOT NULL,
@@ -557,14 +617,6 @@ public sealed class SqliteDocumentWorkspaceRepository(
             """,
             cancellationToken);
 
-        await SqliteModelSettingsRepository.EnsureColumnsAsync(conn, "DocumentMeta", [
-            ("WorkspaceMode", "TEXT NOT NULL DEFAULT 'standard'"),
-            ("RetainDatabase", "INTEGER NOT NULL DEFAULT 0")
-        ], cancellationToken);
-
-        await SqliteModelSettingsRepository.EnsureColumnsAsync(conn, "DocumentFigures", [
-            ("CaptionBboxX", "REAL NULL"), ("CaptionBboxY", "REAL NULL"),
-            ("CaptionBboxW", "REAL NULL"), ("CaptionBboxH", "REAL NULL")
-        ], cancellationToken);
+        await EnsureColumnsAsyncCompat(conn, cancellationToken);
     }
 }

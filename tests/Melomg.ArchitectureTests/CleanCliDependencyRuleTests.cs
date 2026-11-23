@@ -2,6 +2,7 @@ using System.Reflection;
 using Melomg.Application;
 using Melomg.Cli.Commands;
 using Melomg.Domain.Common;
+using Melomg.Domain.Documents;
 using Melomg.Infrastructure;
 using Xunit;
 
@@ -128,5 +129,39 @@ public sealed class CleanCliDependencyRuleTests
             foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static))
                 Assert.NotEqual(typeof(Console), prop.PropertyType);
         }
+    }
+
+    [Fact]
+    public void Domain_OnlySupportsVisualImageAndDiagramCategories()
+    {
+        var names = Enum.GetNames<FigureCategory>();
+        Assert.Equal(["Figure", "Diagram", "Chart"], names);
+        Assert.DoesNotContain("Table", names);
+        Assert.DoesNotContain("Formula", names);
+        Assert.DoesNotContain("Equation", names);
+        Assert.DoesNotContain("Box", names);
+    }
+
+    [Fact]
+    public void AllMelomgAssemblies_ShareUnifiedProjectVersion()
+    {
+        var domainAsm = typeof(Result).Assembly;
+        var appAsm = typeof(Melomg.Application.DependencyInjection).Assembly;
+        var infraAsm = typeof(MelomgStorageOptions).Assembly;
+        var cliAsm = typeof(IngestCliCommand).Assembly;
+
+        string expected = MelomgVersion.Resolve(domainAsm);
+        Assert.False(string.IsNullOrWhiteSpace(expected));
+        Assert.Equal("2.1.0", expected);
+        Assert.Equal(expected, MelomgVersion.Resolve(appAsm));
+        Assert.Equal(expected, MelomgVersion.Resolve(infraAsm));
+        Assert.Equal(expected, MelomgVersion.Resolve(cliAsm));
+        Assert.Equal(expected, VersionCliCommand.GetCliVersion());
+
+        var assemblyVersion = domainAsm.GetName().Version;
+        Assert.NotNull(assemblyVersion);
+        Assert.Equal(assemblyVersion, appAsm.GetName().Version);
+        Assert.Equal(assemblyVersion, infraAsm.GetName().Version);
+        Assert.Equal(assemblyVersion, cliAsm.GetName().Version);
     }
 }

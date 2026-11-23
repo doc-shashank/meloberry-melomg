@@ -1,54 +1,22 @@
 # `melomg` Command Reference
 
-Complete reference for the 23 registered CLI commands.
+All commands are strictly verb-first, stateless, and non-interactive. Pass `-` for `<file|->` to read JSON from `stdin`.
 
----
-
-## 1. PDF Ingestion & Workspaces
-
-| Command | Syntax | Notes |
+| Command | Syntax | Description |
 | :--- | :--- | :--- |
-| `ingest` | `ingest <pdfPath> [workingDir] [--confidence <0.05..0.99>] [--model <onnxPath>] [--title <title>] [--offline] [--retain-db]` | Parses PDF structure (inherited `/Rotate`, `/CropBox`, `/ObjStm` bounds, octal escapes), detects figures/captions, writes `Doc_<d/t>/Doc_<d/t>.db` (auto-discarded on `extract` unless `--retain-db`) |
-| `open` | `open <pdfPath\|projectDir> [projectDir] [--confidence <0.05..0.99>] [--model <onnxPath>] [--title <title>] [--offline]` | Opens a PDF as a persistent project (moving PDF into `[projectDir]` or `./project_<PDF name>/`, rolling back if DB creation fails) or re-activates an existing project directory |
-| `usedoc` | `[<docID>] usedoc [docID]` | Activates an existing `Doc_<d/t>` workspace (also accepts `--doc <docID>`) |
-| `listdocs` | `listdocs [directory]` | Lists registered workspaces and discovers portable folders (prunes missing DB entries; separator-safe; tolerates corrupt/unrelated `.db` files) |
-| `info` | `[<docID>] info` | Displays PDF metadata, SHA-256, page dimensions, ONNX model used, and figure breakdown |
-| `settitle` | `[<docID>] settitle <title>` | Updates workspace title |
-| `reanalyze` | `[<docID>] reanalyze [--confidence <0.05..0.99>] [--model <onnxPath>] [--offline]` | Re-runs Hybrid ONNX detection on the stored PDF and refreshes detected figures |
-
----
-
-## 2. Figure Inspection & Refinement
-
-| Command | Syntax | Notes |
-| :--- | :--- | :--- |
-| `figures` | `[<docID>] figures [--page <n>] [--category <type>] [--min-confidence <0..1>]` | Lists detected/manual figures (`Figure`, `Chart`, `Diagram`, `Table`, `Formula`) |
-| `inspect` | `[<figID>] inspect` | Prints geometry, normalized box, caption association, saved masks, and detected text labels |
-| `addfigure` | `[<docID>] addfigure <page> <x> <y> <width> <height> [--category <cat>] [--caption <text>] [--label <text>] [index]` | Manually registers a figure box (in PDF points) at `[index]` or appends |
-| `setbbox` | `[<figID>] setbbox <x> <y> <width> <height>` | Updates figure bounding box (in PDF points) within page dimensions |
-| `setcaption` | `[<figID>] setcaption <text>` | Overrides or assigns figure caption |
-| `setlabel` | `[<figID>] setlabel <label>` | Sets or updates short label (e.g., `Figure 2.1`) |
-| `setcategory` | `[<figID>] setcategory <figure\|chart\|diagram\|table\|formula>` | Sets figure classification category |
-| `setindex` | `[<figID>] setindex <number> <exchange\|shift>` | Reorders 1-based figure index via swap or shift |
-| `mask` | `[<figID>] mask <list\|add\|auto\|remove\|clear> [args...]` | `list`, `add <x> <y> <w> <h> [--label <text>] [--style <solid\|blur\|pixelate\|whiteout\|crosshatch>] [--color <#RRGGBB>]`, `auto [--match <patterns>] [--style ...] [--color ...]`, `remove <maskIndex>`, `clear` |
-
----
-
-## 3. Extraction & Page Rendering
-
-| Command | Syntax | Notes |
-| :--- | :--- | :--- |
-| `extract` | `[<docID\|figID>] extract [all\|<index>\|<figID>\|page <n>] [outputDir] [--format <png\|jpg>] [--dpi <72..600>] [--quality <1..100\|low\|medium\|high\|max>] [--padding <0..100>] [--include-caption] [--obfuscate-labels] [--obfuscate-label <patterns>] [--obfuscate-style <solid\|blur\|pixelate\|whiteout\|crosshatch>] [--obfuscate-color <#RRGGBB>] [--no-masks] [--meta] [--keep-overlay] [--retain-db]` | Extracts figure crops as PNG/JPEG, supports literal substrings, globs (`*`, `?`), or regexes (250 ms timeout) on `--obfuscate-label`/`--match`, validates PNG/JPEG magic bytes, writes optional `.meta.json`, and cleans up tracked QA overlays unless `--keep-overlay` |
-| `render` | `[<docID>] render <pageNum\|all> [outputDir] [--format <png\|jpg>] [--dpi <72..600>] [--quality <1..100\|low\|medium\|high\|max>] [--overlay]` | Renders full PDF pages (`page_001.png` or `page_001_overlay.png` with blue figure boxes, emerald dashed captions, crimson hatched masks) |
-
----
-
-## 4. ONNX Models, Runtime & Diagnostics
-
-| Command | Syntax | Notes |
-| :--- | :--- | :--- |
-| `model` | `model <info\|set\|threshold\|reset> [args...]` | `info`, `set <onnxPath> [--confidence <0.05..0.99>] [--iou <0.10..0.95>]`, `threshold <confidence> [iou]`, `reset` |
-| `runtime` | `runtime <status\|install\|uninstall> [--provider <directml\|cpu>] [--skip-model] [--keep-model] [--force] [--yes]` | Inspects, installs/rolls back with SHA-256 + length + PE checks, or uninstalls AppData ONNX Runtime DLLs |
-| `delete` | `<docID\|figID> delete [--yes]` | Prints impact `WARNING` to `stderr`, prompts `[y/N]` (`stderr` under `--json`), deletes entity (confined to dedicated workspace dirs) and shifts trailing indices |
-| `lint` | `[<docID\|figID>] lint` | Verifies stored PDF SHA-256 integrity, bounding boxes, and extracted image headers |
-| `docs` / `help` | `docs [topic] [--all]` / `help [topic]` | Displays embedded Markdown guides (`overview`, `commands`, `onnx`, `agent`, `architecture`) or command reference |
+| `prime` | `melomg prime` *(or `melomg` / `melomg --help`)* | Print compact AI-agent grammar card |
+| `spec` | `melomg spec [topic...]` | Micro-specs for `extract`, `patch`, `mask`, `batch`, `vocab`, `onnx`, `errors` |
+| `ingest` | `melomg ingest <pdf\|dir\|docId> [-o dir] [--project] [--refresh] [--confidence n] [--model p] [--title t] [--offline] [--retain-db] [--quiet] [--verbose]` | Ingest PDF (defaults DB to `.meloberry/melomg/` unless `-o`/`--project`); returns `vocab`, `anomalies`, `suspectPages`, and `outline` |
+| `get` | `melomg get <addr> [--view outline\|full\|ids] [--page n] [--category figure\|diagram\|chart] [--min-conf n]` | Inspect document or figure (`outline` default) |
+| `ls` | `melomg ls [dir]` | List discovered workspaces (scans CWD and `.meloberry/melomg/`) |
+| `extract` | `melomg extract <addr\|pdf> [nums\|all...] [-o dir] [--format png\|jpg] [--dpi 72..600] [--quality q] [--padding n] [--naming number\|id] [--include-caption] [--mask-all] [--mask-match pat] [--mask-style s] [--mask-color hex] [--no-masks] [--meta] [--manifest] [--keep-overlay] [--retain-db] [--offline] [--quiet] [--verbose]` | Crop image/diagram figure(s) to PNG/JPG, optionally writing `manifest.json` |
+| `patch` | `melomg patch <addr> [file\|-] [--set k=v]... [--move idx:shift\|exchange]` | Update doc `title` or figure `bbox`, `caption`, `label`, `num`, `category`, or order |
+| `add` | `melomg add <docId> <p> <x> <y> <w> <h> [--category figure\|diagram\|chart] [--num n] [--caption t] [--label t] [--index i]`<br>`melomg add <docId> <file\|->` | Manually register an image, diagram, or chart box |
+| `mask` | `melomg mask <figAddr> <ls\|add\|auto\|rm\|clear> [args...]` | Manage label redaction masks on a figure |
+| `render` | `melomg render <docId> <page\|all> [-o dir] [--format png\|jpg] [--dpi n] [--quality q] [--overlay]` | Render full PDF pages for QA inspection |
+| `rm` | `melomg rm <addr>` | Delete document workspace or figure immediately |
+| `check` | `melomg check <addr> [--quiet] [--verbose]` | Verify PDF SHA-256, page bounds, extracted image headers, and sequence/duplicate anomalies |
+| `batch` | `melomg batch <file\|->` | Execute JSON op array sequentially with `$0.id` / `$prev.id` interpolation |
+| `model` | `melomg model <info\|set\|threshold\|reset> [args...]` | Inspect, set, tune thresholds, or reset ONNX model |
+| `runtime` | `melomg runtime <status\|install\|uninstall> [--provider directml\|cpu] [--skip-model] [--keep-model] [--force]` | Manage AppData ONNX Runtime DLLs and DocLayout-YOLO weights |
+| `version` | `melomg version` *(or `-v` / `--version`)* | Print CLI version and .NET runtime |

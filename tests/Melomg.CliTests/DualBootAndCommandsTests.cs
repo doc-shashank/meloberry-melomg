@@ -3,7 +3,6 @@ using System.Text;
 using System.Text.Json;
 using Melomg.Cli.Abstractions;
 using Melomg.Cli.Hosting;
-using Melomg.Infrastructure.Onnx;
 using Xunit;
 
 namespace Melomg.CliTests;
@@ -11,63 +10,305 @@ namespace Melomg.CliTests;
 public sealed class DualBootAndCommandsTests
 {
     [Fact]
-    public async Task StatelessChain_And_Isolation_WorkEndToEnd()
+    public async Task BareCliPrintsPrime_SpecAndVersionWork_AndAgentEnvVarsEmitMinifiedJson()
+    {
+        var root = CreateTempRoot();
+        var envAppData = Path.Combine(root, "env_appdata");
+        string? origMelomgAgent = Environment.GetEnvironmentVariable("MELOMG_AGENT");
+        string? origMbyAgent = Environment.GetEnvironmentVariable("MBY_AGENT");
+        string? origAppData = Environment.GetEnvironmentVariable("MELOMG_APP_DATA");
+
+        try
+        {
+            Environment.SetEnvironmentVariable("MELOMG_AGENT", null);
+            Environment.SetEnvironmentVariable("MBY_AGENT", null);
+            Environment.SetEnvironmentVariable("MELOMG_APP_DATA", envAppData);
+
+            // 1. Bare melomg prints compact ~280-token prime grammar card (REPL removed)
+            var primeConsole = new TestConsole();
+            int primeCode = await CliApplicationRunner.ExecuteAsync([], primeConsole);
+            Assert.Equal(ExitCodes.Success, primeCode);
+            Assert.Contains("ADDR:", primeConsole.StandardOutput);
+            Assert.Contains("CMDS:", primeConsole.StandardOutput);
+            Assert.Contains("EXIT:", primeConsole.StandardOutput);
+            Assert.DoesNotContain("melomg >", primeConsole.StandardOutput);
+
+            // 2. -v / version & -h / help & spec topics
+            var verConsole = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["-v"], verConsole));
+            Assert.Contains("melomg ", verConsole.StandardOutput);
+
+            var helpConsole = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["-h"], helpConsole));
+            Assert.Contains("spec", helpConsole.StandardOutput);
+
+            var specConsole = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["spec", "vocab", "errors"], specConsole));
+            Assert.Contains("# vocab", specConsole.StandardOutput);
+            Assert.Contains("# errors", specConsole.StandardOutput);
+
+            // 3. MELOMG_AGENT=1 auto-enables minified JSON + honors MELOMG_APP_DATA
+            Environment.SetEnvironmentVariable("MELOMG_AGENT", "1");
+            var agentConsole = new TestConsole();
+            int agentCode = await CliApplicationRunner.ExecuteAsync(["runtime", "status"], agentConsole);
+            Assert.Equal(ExitCodes.Success, agentCode);
+            string trimmed1 = agentConsole.StandardOutput.TrimEnd('\r', '\n');
+            Assert.DoesNotContain('\n', trimmed1);
+            using (var doc = JsonDocument.Parse(trimmed1))
+            {
+                Assert.True(doc.RootElement.GetProperty("success").GetBoolean());
+                Assert.Contains(envAppData, doc.RootElement.GetProperty("data").GetProperty("runtimeDirectory").GetString()!, StringComparison.OrdinalIgnoreCase);
+            }
+
+            // 4. MBY_AGENT=1 (shared Meloberry toolchain env) also auto-enables minified JSON & WhenWritingNull
+            Environment.SetEnvironmentVariable("MELOMG_AGENT", null);
+            Environment.SetEnvironmentVariable("MBY_AGENT", "1");
+            var mbyConsole = new TestConsole();
+            int mbyCode = await CliApplicationRunner.ExecuteAsync(["version"], mbyConsole);
+            Assert.Equal(ExitCodes.Success, mbyCode);
+            string trimmed2 = mbyConsole.StandardOutput.TrimEnd('\r', '\n');
+            Assert.DoesNotContain('\n', trimmed2);
+            using (var doc2 = JsonDocument.Parse(trimmed2))
+            {
+                Assert.True(doc2.RootElement.GetProperty("success").GetBoolean());
+                Assert.False(doc2.RootElement.TryGetProperty("error", out _));
+                var data = doc2.RootElement.GetProperty("data");
+                Assert.Equal("melomg", data.GetProperty("tool").GetString());
+                Assert.Equal(Melomg.Domain.Common.MelomgVersion.Current, data.GetProperty("version").GetString());
+            }
+
+            var primeJsonConsole = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["prime"], primeJsonConsole));
+            using (var docPrime = JsonDocument.Parse(primeJsonConsole.StandardOutput.TrimEnd('\r', '\n')))
+            {
+                Assert.Equal(Melomg.Domain.Common.MelomgVersion.Current, docPrime.RootElement.GetProperty("data").GetProperty("version").GetString());
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("MELOMG_AGENT", origMelomgAgent);
+            Environment.SetEnvironmentVariable("MBY_AGENT", origMbyAgent);
+            Environment.SetEnvironmentVariable("MELOMG_APP_DATA", origAppData);
+            TryCleanup(root);
+        }
+    }
+
+    [Fact]
+    public async Task CoreWorkflow_IngestGetLsExtractAndOneShot_UseNumberTargetingAndSemanticFilenames()
     {
         var root = CreateTempRoot();
         var appData = Path.Combine(root, "appdata");
         var workDir = Path.Combine(root, "work");
+        var outDir = Path.Combine(root, "assets");
+        var oneShotOutDir = Path.Combine(root, "oneshot_assets");
+        var projectDir = Path.Combine(root, "proj_ws");
+        Directory.CreateDirectory(workDir);
+
+        try
+        {
+            var pdfPath = Path.Combine(root, "anatomy.pdf");
+            await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
+
+            // 1. Ingest with --retain-db --offline --json
+            var ingestC = new TestConsole();
+            int ingestCode = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "ingest", pdfPath, "-o", workDir, "--retain-db", "--offline"],
+                ingestC,
+                appData);
+            Assert.Equal(ExitCodes.Success, ingestCode);
+
+            string docId;
+            using (var json = JsonDocument.Parse(ingestC.StandardOutput))
+            {
+                var data = json.RootElement.GetProperty("data");
+                docId = data.GetProperty("id").GetString()!;
+                Assert.Equal("Fig.", data.GetProperty("vocab").GetProperty("primary").GetString());
+                Assert.Equal(2, data.GetProperty("figureCount").GetInt32());
+                Assert.False(File.Exists(Path.Combine(workDir, docId, "source.pdf")));
+            }
+
+            // 2. ls discovers workspace with vocabPrimaryPrefix
+            var lsC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "ls", workDir], lsC, appData));
+            using (var lsJson = JsonDocument.Parse(lsC.StandardOutput))
+            {
+                var arr = lsJson.RootElement.GetProperty("data");
+                Assert.Equal(1, arr.GetArrayLength());
+                Assert.Equal(docId, arr[0].GetProperty("documentId").GetString());
+                Assert.Equal("Fig.", arr[0].GetProperty("vocabPrimaryPrefix").GetString());
+            }
+
+            // 3. get views: outline (default), full, ids, and figure address (#2.1)
+            var getIdsC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "get", docId, "--view", "ids"], getIdsC, appData));
+            using (var idsJson = JsonDocument.Parse(getIdsC.StandardOutput))
+                Assert.Equal(2, idsJson.RootElement.GetProperty("data").GetProperty("ids").GetArrayLength());
+
+            var getFullC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "get", $"{docId}#2.1", "--view", "full"], getFullC, appData));
+            using (var fullJson = JsonDocument.Parse(getFullC.StandardOutput))
+                Assert.Equal("2.1", fullJson.RootElement.GetProperty("data").GetProperty("figure").GetProperty("figureNumber").GetString());
+
+            // 4. Targeted extract by #num -> semantic filename fig_2.1.png, no .meta.json by default
+            var ext1C = new TestConsole();
+            int ext1Code = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "extract", $"{docId}#2.1", "-o", outDir, "--quality", "high"],
+                ext1C,
+                appData);
+            Assert.Equal(ExitCodes.Success, ext1Code);
+            Assert.True(File.Exists(Path.Combine(outDir, "fig_2.1.png")));
+            Assert.Empty(Directory.GetFiles(outDir, "*.meta.json"));
+
+            // 5. Multi-number selector (comma + space) as JPG with quality preset and --naming id
+            var ext2C = new TestConsole();
+            int ext2Code = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "extract", docId, "2.1,2.2", "-o", outDir, "--format", "jpg", "--quality", "80", "--naming", "id"],
+                ext2C,
+                appData);
+            Assert.Equal(ExitCodes.Success, ext2Code);
+            Assert.Equal(2, Directory.GetFiles(outDir, "Fig_*.jpg").Length);
+
+            var ext3C = new TestConsole();
+            int ext3Code = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "extract", docId, "2.1", "2.2", "-o", Path.Combine(root, "multi_space"), "--format", "png", "--dpi", "120"],
+                ext3C,
+                appData);
+            Assert.Equal(ExitCodes.Success, ext3Code);
+            Assert.True(File.Exists(Path.Combine(root, "multi_space", "fig_2.1.png")));
+            Assert.True(File.Exists(Path.Combine(root, "multi_space", "fig_2.2.png")));
+
+            // 6. One-shot extract directly on PDF with figure number; zero stray Doc_* workspaces remain in CWD
+            var beforeCwdDocs = Directory.GetDirectories(Directory.GetCurrentDirectory(), "Doc_*");
+            var oneshotC = new TestConsole();
+            int oneshotCode = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "extract", pdfPath, "2.1", "-o", oneShotOutDir, "--offline"],
+                oneshotC,
+                appData);
+            Assert.Equal(ExitCodes.Success, oneshotCode);
+            Assert.True(File.Exists(Path.Combine(oneShotOutDir, "fig_2.1.png")));
+            Assert.Empty(Directory.GetDirectories(oneShotOutDir, "Doc_*"));
+            var afterCwdDocs = Directory.GetDirectories(Directory.GetCurrentDirectory(), "Doc_*");
+            Assert.Equal(beforeCwdDocs.Length, afterCwdDocs.Length);
+
+            // 7. Project mode + --refresh + unknown number error envelope with hint
+            var projPdf = Path.Combine(root, "proj_paper.pdf");
+            await File.WriteAllBytesAsync(projPdf, BuildSamplePdfBytes());
+            var projC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "ingest", projPdf, "--project", "-o", projectDir, "--offline"], projC, appData));
+            string projId = JsonDocument.Parse(projC.StandardOutput).RootElement.GetProperty("data").GetProperty("id").GetString()!;
+
+            var refreshC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "ingest", projId, "--refresh", "--offline"], refreshC, appData));
+
+            var errC = new TestConsole();
+            int errCode = await CliApplicationRunner.ExecuteAsync(["--json", "extract", $"{docId}#99.9"], errC, appData);
+            Assert.Equal(ExitCodes.NotFound, errCode);
+            using (var errJson = JsonDocument.Parse(errC.StandardError))
+            {
+                Assert.False(errJson.RootElement.GetProperty("success").GetBoolean());
+                var errObj = errJson.RootElement.GetProperty("error");
+                Assert.Equal("Figure.NotFound", errObj.GetProperty("code").GetString());
+                Assert.False(string.IsNullOrWhiteSpace(errObj.GetProperty("hint").GetString()));
+            }
+        }
+        finally
+        {
+            TryCleanup(root);
+        }
+    }
+
+    [Fact]
+    public async Task PatchAddRejectsTable_MaskRenderAutoCleanup_CheckModelRuntimeAndNonInteractiveRm()
+    {
+        var root = CreateTempRoot();
+        var appData = Path.Combine(root, "appdata");
+        var workDir = Path.Combine(root, "work");
+        var qaDir = Path.Combine(root, "qa");
         var outDir = Path.Combine(root, "crops");
         Directory.CreateDirectory(workDir);
 
         try
         {
-            var pdfPath = Path.Combine(root, "paper.pdf");
+            var pdfPath = Path.Combine(root, "refinement.pdf");
             await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
 
-            // 1. Fluent chain in stateless mode with --json (--retain-db keeps DB for multi-extract & lint)
-            var c1 = new TestConsole();
-            int code1 = await CliApplicationRunner.ExecuteAsync(
-                ["--json", $"ingest \"{pdfPath}\" \"{workDir}\" --offline --retain-db -> figures -> extract 1 \"{outDir}\" --format png --dpi 200 --padding 10 -> extract all \"{outDir}\" --format jpg --dpi 150 -> lint"],
-                c1,
+            var ingestC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "ingest", pdfPath, "-o", workDir, "--retain-db", "--offline"], ingestC, appData));
+            string docId = JsonDocument.Parse(ingestC.StandardOutput).RootElement.GetProperty("data").GetProperty("id").GetString()!;
+
+            // 1. Repeatable --set + --move on patch
+            var patchDocC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "patch", docId, "--set", "title=Refined Atlas"], patchDocC, appData));
+            Assert.Contains("Refined Atlas", patchDocC.StandardOutput);
+
+            var patchFigC = new TestConsole();
+            int patchFigCode = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "patch", $"{docId}#f1", "--set", "category=diagram", "--set", "label=Diag 2.1", "--set", "num=2.5", "--set", "bbox=75,110,230,170", "--move", "2:exchange"],
+                patchFigC,
                 appData);
+            Assert.Equal(ExitCodes.Success, patchFigCode);
+            using (var pJson = JsonDocument.Parse(patchFigC.StandardOutput))
+                Assert.Equal("diagram", pJson.RootElement.GetProperty("data").GetProperty("category").GetString());
 
-            Assert.Equal(ExitCodes.Success, code1);
-            Assert.Contains("\"extractedCount\"", c1.StandardOutput);
-            Assert.Contains("\"inferenceEngine\": \"managed-fallback\"", c1.StandardOutput);
-            Assert.Contains("\"isClean\": true", c1.StandardOutput);
+            // 2. Stdin JSON patch
+            var patchStdinC = new TestConsole("""{"caption":"Patched via stdin"}""");
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "patch", $"{docId}#f1", "-"], patchStdinC, appData));
+            Assert.Contains("Patched via stdin", patchStdinC.StandardOutput);
 
-            // Verify real files emitted into outDir without residual .meta.json by default
-            Assert.NotEmpty(Directory.GetFiles(outDir, "*.png"));
-            Assert.NotEmpty(Directory.GetFiles(outDir, "*.jpg"));
-            Assert.Empty(Directory.GetFiles(outDir, "*.meta.json"));
+            // 3. add valid diagram vs add rejected table
+            var addOkC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+                ["--json", "add", docId, "1", "50", "50", "180", "120", "--category", "diagram", "--num", "3.1", "--caption", "Diagram 3.1: Pathway"],
+                addOkC,
+                appData));
 
-            // Verify opt-in --meta writes sidecar metadata
-            var cMeta = new TestConsole();
-            var listPre = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], listPre, appData));
-            using var preDoc = JsonDocument.Parse(listPre.StandardOutput);
-            string preDocId = preDoc.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
-            Assert.False(File.Exists(Path.Combine(workDir, preDocId, "source.pdf")));
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", preDocId, "extract", "1", outDir, "--meta"], cMeta, appData));
-            Assert.NotEmpty(Directory.GetFiles(outDir, "*.meta.json"));
+            var addTableC = new TestConsole();
+            int addTableCode = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "add", docId, "1", "50", "50", "180", "120", "--category", "table"],
+                addTableC,
+                appData);
+            Assert.Equal(ExitCodes.ValidationError, addTableCode);
+            Assert.Contains("Figure.InvalidCategory", addTableC.StandardError);
 
-            // 2. Subsequent stateless call without --doc fails cleanly
-            var c2 = new TestConsole();
-            int code2 = await CliApplicationRunner.ExecuteAsync(["figures"], c2, appData);
-            Assert.Equal(ExitCodes.ValidationError, code2);
-            Assert.Contains("Cli.MissingDocument", c2.StandardError);
+            // 4. Mask subcommands (auto, ls, add, rm, clear) on #3.1
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "mask", $"{docId}#3.1", "auto"], new TestConsole(), appData));
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "mask", $"{docId}#3.1", "add", "60", "60", "40", "14", "--style", "blur", "--label", "ManualLabel"], new TestConsole(), appData));
+            var maskLsC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "mask", $"{docId}#3.1", "ls"], maskLsC, appData));
+            Assert.Contains("ManualLabel", maskLsC.StandardOutput);
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "mask", $"{docId}#3.1", "rm", "1"], new TestConsole(), appData));
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "mask", $"{docId}#3.1", "clear"], new TestConsole(), appData));
 
-            // 3. Extract DocumentId via listdocs --json and query with --doc
-            var c3 = new TestConsole();
-            int code3 = await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], c3, appData);
-            Assert.Equal(ExitCodes.Success, code3);
-            using var jsonDoc = JsonDocument.Parse(c3.StandardOutput);
-            string docId = jsonDoc.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
+            // 5. Render QA overlay -> extract cleans up tracked overlay
+            var renderC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "render", docId, "1", "-o", qaDir, "--overlay"], renderC, appData));
+            string overlayPath = JsonDocument.Parse(renderC.StandardOutput).RootElement.GetProperty("data").GetProperty("artifacts")[0].GetProperty("outputImagePath").GetString()!;
+            Assert.True(File.Exists(overlayPath));
 
-            var c4 = new TestConsole();
-            int code4 = await CliApplicationRunner.ExecuteAsync(["--doc", docId, "info"], c4, appData);
-            Assert.Equal(ExitCodes.Success, code4);
-            Assert.Contains(docId, c4.StandardOutput);
+            var extCleanC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "extract", $"{docId}#3.1", "-o", outDir], extCleanC, appData));
+            Assert.Equal(1, JsonDocument.Parse(extCleanC.StandardOutput).RootElement.GetProperty("data").GetProperty("cleanedOverlayCount").GetInt32());
+            Assert.False(File.Exists(overlayPath));
+
+            // 6. check, model, runtime uninstall, non-interactive rm figure & rm workspace
+            var checkC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "check", docId], checkC, appData));
+            Assert.True(JsonDocument.Parse(checkC.StandardOutput).RootElement.GetProperty("data").GetProperty("isClean").GetBoolean());
+
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "model", "info"], new TestConsole(), appData));
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "model", "threshold", "0.42"], new TestConsole(), appData));
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "model", "reset"], new TestConsole(), appData));
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "runtime", "uninstall"], new TestConsole(), appData));
+
+            // Non-interactive rm without --yes or stdin prompts
+            var rmFigC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "rm", $"{docId}#3.1"], rmFigC, appData));
+            Assert.Equal("figure", JsonDocument.Parse(rmFigC.StandardOutput).RootElement.GetProperty("data").GetProperty("entityKind").GetString());
+
+            var rmDocC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "rm", docId], rmDocC, appData));
+            Assert.Equal("document", JsonDocument.Parse(rmDocC.StandardOutput).RootElement.GetProperty("data").GetProperty("entityKind").GetString());
+            Assert.False(Directory.Exists(Path.Combine(workDir, docId)));
         }
         finally
         {
@@ -76,479 +317,128 @@ public sealed class DualBootAndCommandsTests
     }
 
     [Fact]
-    public async Task InteractiveRepl_RetainsActiveState_SupportsRefinement_And_DeletionGuards()
+    public async Task BatchCommand_InterpolatesIds_And_FailsFastWithIndexedPath()
     {
         var root = CreateTempRoot();
         var appData = Path.Combine(root, "appdata");
         var workDir = Path.Combine(root, "work");
+        var outDir = Path.Combine(root, "batch_out");
         Directory.CreateDirectory(workDir);
 
         try
         {
-            var pdfPath = Path.Combine(root, "paper.pdf");
+            var pdfPath = Path.Combine(root, "batch.pdf");
             await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
 
-            var replScript = string.Join(Environment.NewLine,
-            [
-                $"ingest \"{pdfPath}\" \"{workDir}\" --title \"REPL Test Doc\" --offline --retain-db",
-                "settitle \"Updated REPL Doc\"",
-                "figures",
-                "inspect",
-                "setcaption \"Updated Figure Caption\"",
-                "setlabel \"Fig. 1A\"",
-                "setcategory diagram",
-                "setbbox 75 125 250 185",
-                "addfigure 1 340 400 180 120 --category table --caption \"Table 1: Metrics\"",
-                "setindex 1 shift",
-                "extract page 1 --dpi 150",
-                "lint",
-                "exit"
-            ]);
+            string batchJson = JsonSerializer.Serialize(new object[]
+            {
+                new { op = "ingest", pdf = pdfPath, @out = workDir, offline = true, retainDb = true },
+                new { op = "patch", addr = "$0.id", set = new { title = "Batch Renamed" } },
+                new { op = "extract", addr = "$0.id#2.1", @out = outDir, quality = "medium" },
+                new { op = "check", addr = "$prev.id" },
+                new { op = "rm", addr = "$0.id" }
+            });
 
-            var console = new TestConsole(replScript);
-            int code = await CliApplicationRunner.ExecuteAsync([], console, appData);
+            var okConsole = new TestConsole(batchJson);
+            int okCode = await CliApplicationRunner.ExecuteAsync(["--json", "batch", "-"], okConsole, appData);
+            Assert.Equal(ExitCodes.Success, okCode);
+            using (var doc = JsonDocument.Parse(okConsole.StandardOutput))
+                Assert.Equal(5, doc.RootElement.GetProperty("data").GetProperty("executedCount").GetInt32());
+            Assert.True(File.Exists(Path.Combine(outDir, "fig_2.1.png")));
 
+            // Invalid op at step 1 fails fast and reports path "batch[1].set"
+            string badBatch = JsonSerializer.Serialize(new object[]
+            {
+                new { op = "ingest", pdf = pdfPath, @out = workDir, offline = true, retainDb = true },
+                new { op = "patch", addr = "$0.id", set = new { unknownKey = "oops" } }
+            });
+            var errConsole = new TestConsole(badBatch);
+            int errCode = await CliApplicationRunner.ExecuteAsync(["--json", "batch", "-"], errConsole, appData);
+            Assert.Equal(ExitCodes.ValidationError, errCode);
+            using (var errDoc = JsonDocument.Parse(errConsole.StandardError))
+            {
+                string? errPath = errDoc.RootElement.GetProperty("error").GetProperty("path").GetString();
+                Assert.NotNull(errPath);
+                Assert.StartsWith("batch[1]", errPath, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            TryCleanup(root);
+        }
+    }
+
+    [Fact]
+    public async Task IngestQuietAndVerbose_ExtractManifest_CheckAnomalies_And_DefaultWorkspaceUnderMeloberry()
+    {
+        var root = CreateTempRoot();
+        var appData = Path.Combine(root, "appdata");
+        var outDir = Path.Combine(root, "assets");
+        var originalCwd = Directory.GetCurrentDirectory();
+
+        try
+        {
+            Directory.SetCurrentDirectory(root);
+            var pdfPath = Path.Combine(root, "sample.pdf");
+            await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
+
+            // 1. Default ingest without -o places retained workspace under .meloberry/melomg/<docId>
+            var quietIngest = new TestConsole();
+            int code = await CliApplicationRunner.ExecuteAsync(
+                ["--json", "ingest", pdfPath, "--retain-db", "--offline", "--quiet"], quietIngest, appData);
             Assert.Equal(ExitCodes.Success, code);
-            Assert.Contains("melomg > ", console.StandardOutput);
-            Assert.Contains("Updated title of", console.StandardOutput);
-            Assert.Contains("Updated caption for", console.StandardOutput);
-            Assert.Contains("Updated category of", console.StandardOutput);
-            Assert.Contains("Added manual figure", console.StandardOutput);
-            Assert.Contains("Moved figure", console.StandardOutput);
-            Assert.Contains("Lint ", console.StandardOutput);
-            Assert.Contains("CLEAN", console.StandardOutput);
 
-            // Fetch DocId and test deletion guards (abort on 'n', confirm on 'y')
-            var listConsole = new TestConsole();
-            await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], listConsole, appData);
-            using var docJson = JsonDocument.Parse(listConsole.StandardOutput);
-            string docId = docJson.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
-
-            var abortDelete = new TestConsole("n\n");
-            int abortCode = await CliApplicationRunner.ExecuteAsync([docId, "delete"], abortDelete, appData);
-            Assert.Equal(ExitCodes.Success, abortCode);
-            Assert.Contains("WARNING:", abortDelete.StandardError);
-            Assert.Contains("Deletion cancelled.", abortDelete.StandardOutput);
-
-            var confirmDelete = new TestConsole("y\n");
-            int delCode = await CliApplicationRunner.ExecuteAsync([docId, "delete"], confirmDelete, appData);
-            Assert.Equal(ExitCodes.Success, delCode);
-            Assert.Contains($"Deleted document workspace {docId}", confirmDelete.StandardOutput);
-        }
-        finally
-        {
-            TryCleanup(root);
-        }
-    }
-
-    [Fact]
-    public async Task OnnxModelCommands_HelpTopics_And_EmbeddedDocs_WorkProperly()
-    {
-        var root = CreateTempRoot();
-        var appData = Path.Combine(root, "appdata");
-
-        try
-        {
-            // 1. model info
-            var cInfo = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["model", "info"], cInfo, appData));
-            Assert.Contains("melomg_doclayout_v1.onnx", cInfo.StandardOutput);
-
-            // 2. model threshold
-            var cThresh = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["model", "threshold", "0.42", "0.50"], cThresh, appData));
-            Assert.Contains("confidence=0.42", cThresh.StandardOutput);
-
-            // 3. Reject invalid .onnx file
-            var badOnnx = Path.Combine(root, "invalid.onnx");
-            await File.WriteAllTextAsync(badOnnx, "INVALID");
-            var cBad = new TestConsole();
-            Assert.Equal(ExitCodes.ValidationError, await CliApplicationRunner.ExecuteAsync(["model", "set", badOnnx], cBad, appData));
-            Assert.Contains("Model.InvalidModelFormat", cBad.StandardError);
-
-            // 4. Accept valid custom .onnx file & reset
-            var customOnnx = Path.Combine(root, "custom_doclayout.onnx");
-            await File.WriteAllBytesAsync(customOnnx, OnnxProtobufEngine.BuildCompactDocLayoutOnnxModel(512, 512, 18));
-            var cSet = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["model", "set", customOnnx], cSet, appData));
-            Assert.Contains("custom_doclayout.onnx", cSet.StandardOutput);
-
-            var cReset = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["model", "reset"], cReset, appData));
-            Assert.Contains("melomg_doclayout_v1.onnx", cReset.StandardOutput);
-
-            // 5. Help & Embedded docs
-            var cHelp = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--help"], cHelp, appData));
-            Assert.Contains("ingest", cHelp.StandardOutput);
-            Assert.Contains("extract", cHelp.StandardOutput);
-
-            var cDocs = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "docs", "--all"], cDocs, appData));
-            Assert.Contains("ONNX_AND_DETECTION.md", cDocs.StandardOutput);
-            Assert.Contains("COMMANDS.md", cDocs.StandardOutput);
-            Assert.Contains("runtime install", cDocs.StandardOutput);
-
-            // 6. Runtime status, invalid provider validation, and uninstall guard
-            var cRtStatus = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "runtime", "status"], cRtStatus, appData));
-            Assert.Contains("\"activeInferenceEngine\": \"managed-fallback\"", cRtStatus.StandardOutput);
-
-            var cRtBad = new TestConsole();
-            Assert.Equal(ExitCodes.ValidationError, await CliApplicationRunner.ExecuteAsync(["--json", "runtime", "install", "--provider", "bogus"], cRtBad, appData));
-            Assert.Contains("Runtime.InvalidProvider", cRtBad.StandardError);
-
-            var cRtUninst = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--yes", "--json", "runtime", "uninstall"], cRtUninst, appData));
-            Assert.Contains("\"removedFileCount\": 0", cRtUninst.StandardOutput);
-        }
-        finally
-        {
-            TryCleanup(root);
-        }
-    }
-
-    [Fact]
-    public async Task RenderOverlay_And_LabelObfuscationMaskCommands_WorkEndToEnd()
-    {
-        var root = CreateTempRoot();
-        var appData = Path.Combine(root, "appdata");
-        var workDir = Path.Combine(root, "work");
-        var previewDir = Path.Combine(root, "previews");
-        var maskedDir = Path.Combine(root, "masked");
-        var cleanDir = Path.Combine(root, "clean");
-        var jpgHighDir = Path.Combine(root, "jpg_high");
-        var pageLowDir = Path.Combine(root, "page_low");
-        Directory.CreateDirectory(workDir);
-
-        try
-        {
-            var pdfPath = Path.Combine(root, "diagram.pdf");
-            await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
-
-            // Stateless chain: ingest -> render page 1 overlay -> inspect -> mask auto -> extract (--keep-overlay preserves overlay) -> extract (default deletes overlay) -> lint
-            var c1 = new TestConsole();
-            int code1 = await CliApplicationRunner.ExecuteAsync(
-                [
-                    "--json",
-                    $"ingest \"{pdfPath}\" \"{workDir}\" --offline --retain-db -> render 1 \"{previewDir}\" --overlay --dpi 120 --quality medium -> mask auto --style blur -> extract 1 \"{maskedDir}\" --include-caption --keep-overlay -> extract 1 \"{cleanDir}\" --no-masks --keep-overlay -> lint"
-                ],
-                c1,
-                appData);
-
-            Assert.Equal(ExitCodes.Success, code1);
-            Assert.True(File.Exists(Path.Combine(previewDir, "page_001_overlay.png")));
-            Assert.NotEmpty(Directory.GetFiles(maskedDir, "*.png"));
-            Assert.NotEmpty(Directory.GetFiles(cleanDir, "*.png"));
-            Assert.Empty(Directory.GetFiles(maskedDir, "*.meta.json"));
-
-            // Default extract (without --keep-overlay) cleans up tracked QA overlays automatically
-            var cFind = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], cFind, appData));
-            using var jFind = JsonDocument.Parse(cFind.StandardOutput);
-            string overlayDocId = jFind.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
-            var cAutoClean = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", overlayDocId, "extract", "1", cleanDir], cAutoClean, appData));
-            Assert.False(File.Exists(Path.Combine(previewDir, "page_001_overlay.png")));
-
-            // Find Fig_* ID and test --quality preset/numeric on extract/render + invalid quality error
-            var cDocs = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], cDocs, appData));
-            using var jDoc = JsonDocument.Parse(cDocs.StandardOutput);
-            string docId = jDoc.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
-
-            var cHigh = new TestConsole();
-            int highCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", docId, "extract", "1", jpgHighDir, "--format", "jpg", "--quality", "high"],
-                cHigh,
-                appData);
-            Assert.Equal(ExitCodes.Success, highCode);
-            Assert.NotEmpty(Directory.GetFiles(jpgHighDir, "*.jpg"));
-            using (var jHigh = JsonDocument.Parse(cHigh.StandardOutput))
+            string docId;
+            using (var doc = JsonDocument.Parse(quietIngest.StandardOutput))
             {
-                Assert.Equal(240, jHigh.RootElement.GetProperty("data").GetProperty("dpi").GetInt32());
-                Assert.Equal(92, jHigh.RootElement.GetProperty("data").GetProperty("quality").GetInt32());
+                var data = doc.RootElement.GetProperty("data");
+                docId = data.GetProperty("id").GetString()!;
+                string wsDir = data.GetProperty("workspaceDirectory").GetString()!;
+                Assert.Contains(Path.Combine(".meloberry", "melomg"), wsDir, StringComparison.OrdinalIgnoreCase);
+                Assert.True(Directory.Exists(wsDir));
+                // Quiet mode omits figures array
+                Assert.False(data.TryGetProperty("figures", out _));
             }
 
-            var cRenderQ = new TestConsole();
-            int renderQCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", docId, "render", "1", pageLowDir, "--format", "jpg", "--quality", "low"],
-                cRenderQ,
-                appData);
-            Assert.Equal(ExitCodes.Success, renderQCode);
-            Assert.True(File.Exists(Path.Combine(pageLowDir, "page_001.jpg")));
-            using (var jRend = JsonDocument.Parse(cRenderQ.StandardOutput))
+            // 2. Patch second figure number to trigger a sequence gap (2.1 -> 2.4) and run check
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+                ["--json", "patch", $"{docId}#2.2", "--set", "num=2.4", "--set", "caption=Fig. 2.4: Shifted"], new TestConsole(), appData));
+
+            var checkC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "check", docId], checkC, appData));
+            using (var doc = JsonDocument.Parse(checkC.StandardOutput))
             {
-                Assert.Equal(96, jRend.RootElement.GetProperty("data").GetProperty("dpi").GetInt32());
-                Assert.Equal(55, jRend.RootElement.GetProperty("data").GetProperty("quality").GetInt32());
+                var data = doc.RootElement.GetProperty("data");
+                Assert.True(data.GetProperty("isClean").GetBoolean());
+                Assert.Contains(data.GetProperty("issues").EnumerateArray(),
+                    w => w.GetProperty("code").GetString() == "Lint.SequenceGap");
+                Assert.True(data.GetProperty("suspectPages").GetArrayLength() > 0);
             }
 
-            var cBadQ = new TestConsole();
-            int badQCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", docId, "extract", "1", jpgHighDir, "--quality", "999"],
-                cBadQ,
-                appData);
-            Assert.Equal(ExitCodes.ValidationError, badQCode);
-            Assert.Contains("Figure.InvalidQuality", cBadQ.StandardError);
-
-            var repl = new TestConsole(string.Join(Environment.NewLine,
-            [
-                $"usedoc {docId}",
-                "inspect",
-                "mask list",
-                "mask add 100 180 70 18 --label \"Manual Box\" --style whiteout",
-                "mask remove 1",
-                "mask clear",
-                "exit"
-            ]));
-
-            int replCode = await CliApplicationRunner.ExecuteAsync([], repl, appData);
-            Assert.Equal(ExitCodes.Success, replCode);
-            Assert.Contains("Saved Masks:", repl.StandardOutput);
-            Assert.Contains("Encoder Block", repl.StandardOutput);
-            Assert.Contains("Added mask #", repl.StandardOutput);
-            Assert.Contains("Removed mask #1", repl.StandardOutput);
-            Assert.Contains("Cleared ", repl.StandardOutput);
-        }
-        finally
-        {
-            TryCleanup(root);
-        }
-    }
-
-    [Fact]
-    public async Task EphemeralIngest_And_OpenProject_WorkViaCli()
-    {
-        var root = CreateTempRoot();
-        var appData = Path.Combine(root, "appdata");
-        var ephWork = Path.Combine(root, "eph_work");
-        var ephOut = Path.Combine(root, "eph_out");
-        var customProjDir = Path.Combine(root, "custom_study_project");
-        Directory.CreateDirectory(ephWork);
-
-        try
-        {
-            var ephPdf = Path.Combine(root, "oneshot.pdf");
-            await File.WriteAllBytesAsync(ephPdf, BuildSamplePdfBytes());
-
-            // 1. Standard ingest -> extract (no --retain-db) discards temporary DB automatically
-            var cEph = new TestConsole();
-            int ephCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", $"ingest \"{ephPdf}\" \"{ephWork}\" --offline -> extract all \"{ephOut}\""],
-                cEph,
-                appData);
-            Assert.Equal(ExitCodes.Success, ephCode);
-            Assert.Contains("\"retainedDatabase\": false", cEph.StandardOutput);
-            Assert.NotEmpty(Directory.GetFiles(ephOut, "*.png"));
-            Assert.Empty(Directory.GetFiles(ephWork, "*.db", SearchOption.AllDirectories));
-            Assert.Empty(Directory.GetDirectories(ephWork));
-
-            // 2. open <pdfPath> <projectDir> moves the PDF into customProjDir and retains DB
-            var projPdf = Path.Combine(root, "moving_source.pdf");
-            await File.WriteAllBytesAsync(projPdf, BuildSamplePdfBytes());
-
-            var cOpen = new TestConsole();
-            int openCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", $"open \"{projPdf}\" \"{customProjDir}\" --offline -> extract all"],
-                cOpen,
-                appData);
-            Assert.Equal(ExitCodes.Success, openCode);
-            Assert.Contains("\"reopenedExisting\": false", cOpen.StandardOutput);
-            Assert.Contains("\"retainedDatabase\": true", cOpen.StandardOutput);
-            Assert.False(File.Exists(projPdf));
-            Assert.True(File.Exists(Path.Combine(customProjDir, "moving_source.pdf")));
-            Assert.NotEmpty(Directory.GetFiles(customProjDir, "Doc_*.db"));
-            Assert.NotEmpty(Directory.GetFiles(Path.Combine(customProjDir, "figures"), "*.png"));
-
-            // 3. Re-opening project directory loads cached workspace directly
-            var cReopen = new TestConsole();
-            int reopenCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", "open", customProjDir],
-                cReopen,
-                appData);
-            Assert.Equal(ExitCodes.Success, reopenCode);
-            Assert.Contains("\"reopenedExisting\": true", cReopen.StandardOutput);
-        }
-        finally
-        {
-            TryCleanup(root);
-        }
-    }
-
-    [Fact]
-    public async Task BugFixes_AppDataChain_ValueOptions_DashTitles_FlagPrecedence_JsonPrompts_And_CorruptUninstall_Work()
-    {
-        var root = CreateTempRoot();
-        try
-        {
-            var appData1 = Path.Combine(root, "appdata_custom");
-            var workDir = Path.Combine(root, "work");
-            var outDir = Path.Combine(root, "out");
-            Directory.CreateDirectory(workDir);
-            var pdfPath = Path.Combine(root, "paper.pdf");
-            await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
-
-            // TLG-014 + TLG-015: --app-data inside a quoted chain + --quality value option alongside quoted chain
-            var c1 = new TestConsole();
-            int e1 = await CliApplicationRunner.ExecuteAsync(
-                ["--quality", "high", $"--app-data \"{appData1}\" ingest \"{pdfPath}\" \"{workDir}\" --offline --retain-db -> extract all \"{outDir}\""],
-                c1);
-            Assert.True(e1 == ExitCodes.Success, $"ERR: {c1.StandardError}\nOUT: {c1.StandardOutput}");
-            Assert.True(File.Exists(Path.Combine(appData1, ".melomg_id_clock")));
-            Assert.True(Directory.EnumerateFiles(outDir, "Fig_*.png").Any());
-
-            var docA = ExtractFirstTokenWithPrefix(c1.StandardOutput, "Doc_");
-
-            // TLG-015: Literal --heading via `--` and after verb
-            var cTitle = new TestConsole();
-            int eTitle = await CliApplicationRunner.ExecuteAsync(
-                ["--app-data", appData1, docA, "settitle", "--", "-- Section A"],
-                cTitle);
-            Assert.True(eTitle == ExitCodes.Success, $"docA={docA}\nERR={cTitle.StandardError}\nC1_OUT={c1.StandardOutput}");
-
-            // TLG-016: Explicit --doc overrides stale REPL ActiveFigureId on extract; --figure overrides ActiveDocumentId on lint
-            var workDir2 = Path.Combine(root, "work2");
-            Directory.CreateDirectory(workDir2);
-            var c2 = new TestConsole();
-            int e2 = await CliApplicationRunner.ExecuteAsync(
-                [$"ingest \"{pdfPath}\" \"{workDir2}\" --offline --retain-db -> figures"],
-                c2,
-                appData1);
-            Assert.Equal(ExitCodes.Success, e2);
-            var docB = ExtractFirstTokenWithPrefix(c2.StandardOutput, "Doc_");
-            var figB = ExtractFirstTokenWithPrefix(c2.StandardOutput, "Fig_");
-
-            var outOverride = Path.Combine(root, "out_override");
-            var cOverride = new TestConsole();
-            int eOverride = await CliApplicationRunner.ExecuteAsync(
-                [$"usedoc {docB} -> {figB} inspect -> --doc {docA} extract all \"{outOverride}\" --retain-db -> info"],
-                cOverride,
-                appData1);
-            Assert.True(eOverride == ExitCodes.Success, $"ERR={cOverride.StandardError}\nOUT={cOverride.StandardOutput}");
-            Assert.Contains(docA, cOverride.StandardOutput);
-
-            var cLint = new TestConsole();
-            int eLint = await CliApplicationRunner.ExecuteAsync(
-                [$"usedoc {docA} -> --figure {figB} lint"],
-                cLint,
-                appData1);
-            Assert.Equal(ExitCodes.Success, eLint);
-            Assert.Contains(figB, cLint.StandardOutput);
-
-            // TLG-017: --json deletion prompt goes to stderr (leaving clean JSON on stdout)
-            var cDel = new TestConsole("n\n");
-            int eDel = await CliApplicationRunner.ExecuteAsync(
-                ["--json", docA, "delete"],
-                cDel,
-                appData1);
-            Assert.Equal(ExitCodes.Success, eDel);
-            Assert.Contains("Confirm deletion? [y/N]:", cDel.StandardError);
-            Assert.DoesNotContain("Confirm deletion? [y/N]:", cDel.StandardOutput);
-            using (var docJson = JsonDocument.Parse(cDel.StandardOutput))
-                Assert.True(docJson.RootElement.GetProperty("success").GetBoolean());
-
-            // TLG-017: Corrupt runtime directory still prompts confirmation on uninstall instead of silent wipe
-            var corruptRuntimeDir = Path.Combine(appData1, "runtime", "onnxruntime", "win-x64", "1.20.1");
-            Directory.CreateDirectory(corruptRuntimeDir);
-            await File.WriteAllBytesAsync(Path.Combine(corruptRuntimeDir, "onnxruntime.dll"), [0x4D, 0x5A, 0x00, 0x00]);
-            var manifestPath = Path.Combine(appData1, "runtime", "onnxruntime", "win-x64", "manifest.json");
-            await File.WriteAllTextAsync(manifestPath, """
+            // 3. Extract with --manifest --quiet emits manifest.json and omits per-artifact array
+            var extC = new TestConsole();
+            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(
+                ["--json", "extract", docId, "all", "-o", outDir, "--manifest", "--quiet"], extC, appData));
+            string manifestPath;
+            using (var doc = JsonDocument.Parse(extC.StandardOutput))
             {
-              "version": "1.20.1",
-              "provider": "cpu",
-              "installedAtUtc": "2026-01-01T00:00:00Z",
-              "files": [
-                { "fileName": "onnxruntime.dll", "sizeBytes": 4, "sha256": "0000" }
-              ]
+                var data = doc.RootElement.GetProperty("data");
+                manifestPath = data.GetProperty("manifestPath").GetString()!;
+                Assert.False(data.TryGetProperty("artifacts", out _));
             }
-            """);
-
-            var cRt = new TestConsole("n\n");
-            int eRt = await CliApplicationRunner.ExecuteAsync(["--json", "runtime", "uninstall", "--keep-model"], cRt, appData1);
-            Assert.Equal(ExitCodes.Success, eRt);
-            Assert.Contains("Confirm deletion? [y/N]:", cRt.StandardError);
-            Assert.True(File.Exists(Path.Combine(corruptRuntimeDir, "onnxruntime.dll")));
+            Assert.True(File.Exists(manifestPath));
+            using (var mDoc = JsonDocument.Parse(await File.ReadAllTextAsync(manifestPath)))
+            {
+                var figuresEl = mDoc.RootElement.GetProperty("figures");
+                Assert.True(figuresEl.EnumerateObject().Count() >= 2);
+                Assert.True(figuresEl.TryGetProperty("2.1", out _));
+            }
         }
         finally
         {
+            Directory.SetCurrentDirectory(originalCwd);
             TryCleanup(root);
         }
-    }
-
-    [Fact]
-    public async Task CliGrammar_ErrorHandling_And_EphemeralSessionReset_Regressions()
-    {
-        var root = CreateTempRoot();
-        var appData = Path.Combine(root, "appdata");
-        var workDir = Path.Combine(root, "work");
-        var outDir = Path.Combine(root, "out");
-        Directory.CreateDirectory(workDir);
-
-        try
-        {
-            var pdfPath = Path.Combine(root, "paper.pdf");
-            await File.WriteAllBytesAsync(pdfPath, BuildSamplePdfBytes());
-
-            // CLI-01: Unknown flag with --json emits JSON error envelope
-            var badOptJson = new TestConsole();
-            int badCode = await CliApplicationRunner.ExecuteAsync(["--badopt", "--json", "listdocs"], badOptJson, appData);
-            Assert.Equal(ExitCodes.ValidationError, badCode);
-            Assert.Contains("\"code\":\"Cli.ParseError\"", badOptJson.StandardError);
-
-            // CLI-05: Unknown docs topic returns NotFound (exit code 3)
-            var badDocs = new TestConsole();
-            Assert.Equal(ExitCodes.NotFound, await CliApplicationRunner.ExecuteAsync(["docs", "nonexistent-topic"], badDocs, appData));
-
-            // CLI-02 + CLI-03 + CLI-04: '--app-data' after '--', '--title foo->bar', and 'usedoc --doc' + extra arg check
-            var cChain = new TestConsole();
-            int chainCode = await CliApplicationRunner.ExecuteAsync(
-                ["--json", $"ingest \"{pdfPath}\" \"{workDir}\" --offline --retain-db --title foo->bar -> settitle -- \"--app-data\""],
-                cChain,
-                appData);
-            Assert.Equal(ExitCodes.Success, chainCode);
-            Assert.Contains("\"--app-data\"", cChain.StandardOutput);
-
-            var cList = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["--json", "listdocs", workDir], cList, appData));
-            using var listJson = JsonDocument.Parse(cList.StandardOutput);
-            string docId = listJson.RootElement.GetProperty("data")[0].GetProperty("documentId").GetString()!;
-
-            var cUseDocFlag = new TestConsole();
-            Assert.Equal(ExitCodes.Success, await CliApplicationRunner.ExecuteAsync(["usedoc", "--doc", docId], cUseDocFlag, appData));
-
-            var cExtraArg = new TestConsole();
-            Assert.Equal(ExitCodes.ValidationError, await CliApplicationRunner.ExecuteAsync([docId, "info", "unexpectedExtra"], cExtraArg, appData));
-
-            // BUG-06: Non-retained ingest -> extract in REPL clears active document/figure so subsequent 'figures' fails cleanly
-            var replConsole = new TestConsole(string.Join(Environment.NewLine,
-            [
-                $"ingest \"{pdfPath}\" \"{workDir}\" --offline",
-                $"extract all \"{outDir}\"",
-                "figures",
-                "exit"
-            ]));
-            int replCode = await CliApplicationRunner.ExecuteAsync([], replConsole, appData);
-            Assert.Equal(ExitCodes.Success, replCode);
-            Assert.Contains("Discarded temporary workspace DB", replConsole.StandardOutput);
-            Assert.Contains("Cli.MissingDocument", replConsole.StandardError);
-        }
-        finally
-        {
-            TryCleanup(root);
-        }
-    }
-
-    private static string ExtractFirstTokenWithPrefix(string text, string prefix)
-    {
-        foreach (var token in text.Split([' ', '\r', '\n', ',', '(', ')', ':', '"', '/', '\\', '\''], StringSplitOptions.RemoveEmptyEntries))
-        {
-            var clean = token.TrimEnd('.');
-            if (clean.EndsWith(".db", StringComparison.OrdinalIgnoreCase))
-                clean = clean[..^3];
-            if (clean.StartsWith(prefix, StringComparison.Ordinal))
-                return clean;
-        }
-        throw new InvalidOperationException($"Token starting with '{prefix}' not found in:\n{text}");
     }
 
     private static byte[] BuildSamplePdfBytes()
@@ -572,10 +462,10 @@ public sealed class DualBootAndCommandsTests
         string p1Content =
             "q 220 0 0 160 80 500 cm /Im1 Do Q\n" +
             "BT /F1 12 Tf 110 580 Td (Encoder Block) Tj ET\n" +
-            "BT /F1 11 Tf 82 478 Td (Figure 1: Sample Architecture) Tj ET\n" +
+            "BT /F1 11 Tf 82 478 Td (Fig. 2.1: Sample Architecture) Tj ET\n" +
             "1.5 w 0.1 0.2 0.3 RG 0.3 0.6 0.9 rg\n" +
             "90 160 50 90 re B 170 160 50 120 re B 80 160 m 260 160 l S\n" +
-            "BT /F1 11 Tf 82 138 Td (Chart 1: Throughput) Tj ET\n";
+            "BT /F1 11 Tf 82 138 Td (Fig. 2.2: Throughput Chart) Tj ET\n";
 
         using var pdf = new MemoryStream();
         void WriteAscii(string s)
@@ -615,6 +505,7 @@ public sealed class DualBootAndCommandsTests
         long xref = pdf.Position;
         WriteAscii($"xref\n0 {offsets.Count + 1}\n0000000000 65535 f \n");
         foreach (var off in offsets) WriteAscii($"{off:D10} 00000 n \n");
+
         WriteAscii($"trailer\n<< /Size {offsets.Count + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n");
         return pdf.ToArray();
     }

@@ -2,7 +2,7 @@ namespace Melomg.Domain.Common;
 
 public enum ErrorType { Failure, Validation, NotFound, Conflict, Unauthorized, Forbidden }
 
-public sealed record Error(string Code, string Description, ErrorType Type);
+public sealed record Error(string Code, string Description, ErrorType Type, string? Path = null, string? Hint = null);
 
 public class Result
 {

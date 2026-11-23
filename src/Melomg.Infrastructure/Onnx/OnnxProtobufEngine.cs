@@ -16,7 +16,7 @@ public sealed record OnnxRawDetection(
 public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxModelInspector
 {
     private readonly SemaphoreSlim _initLock = new(1, 1);
-    private static readonly string[] DefaultClasses = ["figure", "chart", "diagram", "table", "formula"];
+    private static readonly string[] DefaultClasses = ["figure", "diagram", "chart"];
 
     public async Task<OnnxModelProfile> GetBuiltInDefaultProfileAsync(CancellationToken cancellationToken = default)
     {
@@ -150,9 +150,10 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
                 double confidence = Math.Clamp(0.55 * maxAct + 0.30 * Math.Clamp(meanImg + meanVec, 0f, 1.2f) + 0.15 * Math.Clamp(meanCue, 0f, 1f), 0.0, 0.99);
                 if (confidence < confidenceThreshold) continue;
 
+                if (meanCue > 0.55f && meanImg < 0.2f && normW > 0.45 && normH < 0.35) continue;
+
                 FigureCategory category =
                     meanImg >= meanVec && meanImg > 0.2f ? FigureCategory.Figure :
-                    meanCue > 0.55f && normW > 0.45 && normH < 0.35 ? FigureCategory.Table :
                     meanVec > 0.45f ? (normW / Math.Max(normH, 0.01) > 1.35 ? FigureCategory.Chart : FigureCategory.Diagram) :
                     FigureCategory.Figure;
 
@@ -424,12 +425,12 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
 
         using var metaMs = new MemoryStream();
         WriteStringField(metaMs, 1, "melomg_classes");
-        WriteStringField(metaMs, 2, "figure,chart,diagram,table,formula");
+        WriteStringField(metaMs, 2, "figure,diagram,chart");
 
         using var modelMs = new MemoryStream();
         WriteVarintField(modelMs, 1, 9);
         WriteStringField(modelMs, 2, "melomg-onnx");
-        WriteStringField(modelMs, 3, "1.0.0");
+        WriteStringField(modelMs, 3, MelomgVersion.Resolve(typeof(OnnxProtobufEngine).Assembly));
         WriteStringField(modelMs, 4, "ai.meloberry.melomg");
         WriteVarintField(modelMs, 5, 1);
         WriteStringField(modelMs, 6, "Hybrid PDF figure layout detection ONNX model");

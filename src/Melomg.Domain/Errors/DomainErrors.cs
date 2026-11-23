@@ -1,4 +1,5 @@
 using Melomg.Domain.Common;
+using Melomg.Domain.Documents;
 
 namespace Melomg.Domain.Errors;
 
@@ -16,7 +17,6 @@ public static class DocumentErrors
     public static Error InvalidWorkingDirectory(string path) => new("Document.InvalidWorkingDirectory", $"Working directory '{path}' is invalid.", ErrorType.Validation);
     public static Error EmptyTitle() => new("Document.EmptyTitle", "Document title cannot be empty.", ErrorType.Validation);
     public static Error InvalidPageNumber(int pageNumber, int pageCount) => new("Page.NotFound", $"Page {pageNumber} is outside valid document range [1..{pageCount}].", ErrorType.NotFound);
-    public static Error NoActiveFigure(string docId) => new("Document.NoActiveFigure", $"Document '{docId}' has no active figure.", ErrorType.Conflict);
     public static Error InvalidConfidenceThreshold(double threshold) => new("Document.InvalidConfidenceThreshold", $"Confidence threshold {threshold:F2} must be within [0.05..0.99].", ErrorType.Validation);
     public static Error InvalidPdfFormat(string path, string reason) => new("Pdf.InvalidFormat", $"'{path}' is not a valid PDF file: {reason}", ErrorType.Validation);
     public static Error PdfFileNotFound(string path) => new("File.NotFound", $"Input PDF file '{path}' was not found.", ErrorType.NotFound);
@@ -29,10 +29,15 @@ public static class DocumentErrors
 public static class FigureErrors
 {
     public static Error NotFound(string id) => new("Figure.NotFound", $"Figure '{id}' was not found.", ErrorType.NotFound);
-    public static Error InvalidCategory(string rawCategory) => new("Figure.InvalidCategory", $"Figure category '{rawCategory}' must be one of: figure, chart, diagram, table, formula.", ErrorType.Validation);
+
+    public static Error InvalidCategory(string rawCategory) =>
+        new("Figure.InvalidCategory", $"Figure category '{rawCategory}' must be one of: figure, diagram, chart.", ErrorType.Validation);
+
     public static Error InvalidBoundingBox(string reason) => new("Figure.InvalidBoundingBox", $"Invalid bounding box: {reason}", ErrorType.Validation);
+
     public static Error BoundingBoxOutOfPageBounds(double x, double y, double width, double height, double pageWidth, double pageHeight) =>
         new("Figure.BoundingBoxOutOfPageBounds", $"Bounding box ({x:F1}, {y:F1}, {width:F1}, {height:F1}) exceeds page dimensions ({pageWidth:F1} x {pageHeight:F1} pts).", ErrorType.Validation);
+
     public static Error InvalidConfidence(double confidence) => new("Figure.InvalidConfidence", $"Confidence score {confidence:F3} must be within [0.0..1.0].", ErrorType.Validation);
     public static Error EmptyLabel() => new("Figure.EmptyLabel", "Figure label cannot be empty.", ErrorType.Validation);
     public static Error EmptyCaption() => new("Figure.EmptyCaption", "Figure caption cannot be empty.", ErrorType.Validation);
@@ -40,10 +45,38 @@ public static class FigureErrors
     public static Error InvalidDpi(int dpi) => new("Figure.InvalidDpi", $"DPI {dpi} must be within [72..600].", ErrorType.Validation);
     public static Error InvalidPadding(int paddingPx) => new("Figure.InvalidPadding", $"Padding {paddingPx} px must be within [0..100].", ErrorType.Validation);
     public static Error InvalidQuality(string raw) => new("Figure.InvalidQuality", $"Image quality '{raw}' must be an integer in [1..100] or one of: low, medium, high, max.", ErrorType.Validation);
+    public static Error InvalidNamingMode(string raw) => new("Figure.InvalidNamingMode", $"Naming mode '{raw}' must be 'number' or 'id'.", ErrorType.Validation);
+    public static Error InvalidAddress(string addr, string reason) => new("Figure.InvalidAddress", $"Invalid address '{addr}': {reason}", ErrorType.Validation);
     public static Error NoFiguresMatch(string target) => new("Document.EmptyFigures", $"No figures matched extraction target '{target}'.", ErrorType.Conflict);
     public static Error InvalidObfuscationStyle(string raw) => new("Figure.InvalidObfuscationStyle", $"Obfuscation style '{raw}' is unsupported. Use solid, blur, pixelate, or whiteout.", ErrorType.Validation);
     public static Error InvalidColorHex(string raw) => new("Figure.InvalidColorHex", $"Color '{raw}' must be a 6-digit hex RGB value like '#1E293B'.", ErrorType.Validation);
     public static Error MaskNotFound(int index, int count) => new("Figure.MaskNotFound", $"Mask index #{index} was not found (figure currently has {count} mask(s)).", ErrorType.NotFound);
+
+    public static Error NumberNotFound(string query, DocumentVocabulary vocab, IEnumerable<string> availableNumbers)
+    {
+        var nums = availableNumbers.Where(n => !string.IsNullOrWhiteSpace(n)).Take(10).ToArray();
+        string vocabInfo = string.IsNullOrWhiteSpace(vocab.PrimaryPrefix)
+            ? "No figure caption prefix detected"
+            : $"PDF uses '{vocab.PrimaryPrefix}'";
+        string availInfo = nums.Length > 0
+            ? $"available numbers: {string.Join(", ", nums)}"
+            : "no numbered figures detected; use #f<index>";
+        return new Error(
+            "Figure.NotFound",
+            $"No figure matched number '{query}'.",
+            ErrorType.NotFound,
+            Hint: $"{vocabInfo} ({availInfo}).");
+    }
+
+    public static Error AmbiguousNumber(string query, IEnumerable<string> candidateAddresses)
+    {
+        string list = string.Join(", ", candidateAddresses);
+        return new Error(
+            "Figure.AmbiguousNumber",
+            $"Figure number '{query}' matches multiple figures.",
+            ErrorType.Conflict,
+            Hint: $"Target explicitly using: {list}");
+    }
 }
 
 public static class ModelErrors

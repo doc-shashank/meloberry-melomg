@@ -107,7 +107,17 @@ public sealed class OnnxAndPdfIngestionTests
             int seq = 1;
             foreach (var cand in analysis.Candidates)
             {
-                doc.AddFigure($"Fig_20261120_010000_{seq:000}", cand.PageNumber, cand.Category, cand.BoundingBox, cand.Confidence, cand.Caption, cand.Label, cand.Source);
+                doc.AddFigure(
+                    $"Fig_20261120_010000_{seq:000}",
+                    cand.PageNumber,
+                    cand.Category,
+                    cand.BoundingBox,
+                    cand.Confidence,
+                    cand.Caption,
+                    cand.Label,
+                    cand.Source,
+                    vocabPrefix: cand.VocabPrefix,
+                    figureNumber: cand.FigureNumber);
                 seq++;
             }
 
@@ -120,20 +130,22 @@ public sealed class OnnxAndPdfIngestionTests
 
             Assert.True(pngRes.IsSuccess);
             Assert.True(File.Exists(pngRes.Value.OutputImagePath));
+            Assert.StartsWith("fig_", Path.GetFileName(pngRes.Value.OutputImagePath), StringComparison.Ordinal);
             Assert.Null(pngRes.Value.MetadataJsonPath);
             Assert.Empty(Directory.GetFiles(pngOutDir, "*.meta.json"));
             Assert.True((await extractor.VerifyExtractedImageAsync(pngRes.Value.OutputImagePath)).IsSuccess);
             byte[] pngHeader = await File.ReadAllBytesAsync(pngRes.Value.OutputImagePath);
             Assert.Equal([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], pngHeader[..8]);
 
-            // Opt-in metadata writes <figID>.meta.json
+            // Opt-in metadata writes <outputStem>.meta.json; namingMode="id" preserves legacy Fig_* filenames
             var pngMetaOutDir = Path.Combine(tempRoot, "out_png_meta");
             var pngMetaRes = await extractor.ExtractFigureAsync(
                 doc,
                 doc.Figures[0],
-                ExtractionOptions.Create("png", 150, 8, includeMetadata: true).Value,
+                ExtractionOptions.Create("png", 150, 8, includeMetadata: true, namingMode: "id").Value,
                 pngMetaOutDir);
             Assert.True(pngMetaRes.IsSuccess);
+            Assert.StartsWith("Fig_20261120_010000_", Path.GetFileName(pngMetaRes.Value.OutputImagePath), StringComparison.Ordinal);
             Assert.NotNull(pngMetaRes.Value.MetadataJsonPath);
             Assert.True(File.Exists(pngMetaRes.Value.MetadataJsonPath));
 
@@ -843,7 +855,7 @@ public sealed class OnnxAndPdfIngestionTests
             0.9600,
             null,
             "Figure p28.2",
-            DetectionSource.PdfXObject);
+            DetectionSource.PageLayout);
 
         // Side-by-side separate labeled figure in right column
         var distinctSibling = new DetectedFigureCandidate(
@@ -899,6 +911,134 @@ public sealed class OnnxAndPdfIngestionTests
         Assert.Equal(2, merged.Count);
         Assert.Contains("Fig. 2.30 Morphology of injury.", merged[0].Text);
         Assert.Equal("normal prose in right column", merged[1].Text);
+    }
+
+    [Fact]
+    public async Task HybridPdfEngine_RejectsTablesAndCalloutBoxes_DetectsVocabulary_And_UsesSemanticFilenames()
+    {
+        var tempRoot = CreateTempDirectory();
+        try
+        {
+            var opts = new MelomgStorageOptions { AppDataDirectory = Path.Combine(tempRoot, "appdata") };
+            var onnx = new OnnxProtobufEngine(opts);
+            var renderer = new WindowsPdfPageRenderer();
+            using var sessionHost = new NativeOnnxRuntimeSessionHost();
+            var rt = new OnnxRuntimeManager(opts, onnx, sessionHost);
+            var engine = new HybridOnnxPdfIngestionEngine(onnx, renderer, sessionHost, rt);
+            var extractor = new PngJpegFigureExtractor(renderer, engine);
+
+            string pdfPath = Path.Combine(tempRoot, "tables_boxes_and_figs.pdf");
+            await File.WriteAllBytesAsync(pdfPath, BuildTablesBoxesAndFiguresPdfBytes());
+
+            var profile = await onnx.GetBuiltInDefaultProfileAsync();
+            var analysisRes = await engine.AnalyzePdfAsync(pdfPath, profile);
+            Assert.True(analysisRes.IsSuccess, analysisRes.Error?.Description);
+            var analysis = analysisRes.Value;
+
+            // Only visual figures/diagrams must remain; tables, callout boxes, and prose refs must NOT be emitted
+            Assert.NotEmpty(analysis.Candidates);
+            Assert.DoesNotContain(analysis.Candidates, c =>
+                (c.Caption ?? c.Label ?? string.Empty).Contains("Table 1.1", StringComparison.OrdinalIgnoreCase) ||
+                (c.Caption ?? c.Label ?? string.Empty).Contains("Box 1.1", StringComparison.OrdinalIgnoreCase) ||
+                (c.Caption ?? c.Label ?? string.Empty).Contains("9.9", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(analysis.Candidates, c =>
+                string.Equals(c.FigureNumber, "2.1", StringComparison.Ordinal));
+            Assert.NotNull(analysis.Vocabulary);
+            Assert.Equal("Fig.", analysis.Vocabulary!.PrimaryPrefix);
+            Assert.Contains("Fig.", analysis.Vocabulary.DetectedPrefixes);
+
+            // Verify collision-safe semantic naming (fig_2.1.png, fig_2.1_2.png) vs --naming id (Fig_*.png)
+            string wsDir = Path.Combine(tempRoot, "Doc_Sem");
+            await engine.InitializeWorkspaceAsync(wsDir);
+            var doc = PdfDocument.Create(
+                "Doc_Sem", "Tables Boxes Figs", pdfPath, pdfPath, analysis.Sha256Hash,
+                wsDir, profile.ModelName, 0.35, DateTimeOffset.UtcNow, analysis.Pages).Value;
+
+            var cand21 = analysis.Candidates.First(c => c.FigureNumber == "2.1");
+            Assert.True(doc.AddFigure("Fig_Sem_1", cand21.PageNumber, cand21.Category, cand21.BoundingBox, cand21.Confidence,
+                cand21.Caption, cand21.Label, cand21.Source, vocabPrefix: cand21.VocabPrefix, figureNumber: cand21.FigureNumber).IsSuccess);
+            Assert.True(doc.AddFigure("Fig_Sem_2", cand21.PageNumber, cand21.Category, cand21.BoundingBox, cand21.Confidence,
+                cand21.Caption, cand21.Label, cand21.Source, vocabPrefix: cand21.VocabPrefix, figureNumber: "2.1").IsSuccess);
+
+            string outDir = Path.Combine(tempRoot, "out_sem");
+            var batchRes = await extractor.ExtractFiguresAsync(doc, [doc.Figures[0], doc.Figures[1]], ExtractionOptions.Create("png", 100, 4).Value, outDir);
+            Assert.True(batchRes.IsSuccess);
+            Assert.Equal(2, batchRes.Value.Count);
+            Assert.Equal("fig_2.1.png", Path.GetFileName(batchRes.Value[0].OutputImagePath));
+            Assert.Equal("fig_2.1_i2.png", Path.GetFileName(batchRes.Value[1].OutputImagePath));
+
+            var rId = await extractor.ExtractFigureAsync(doc, doc.Figures[0], ExtractionOptions.Create("png", 100, 4, namingMode: "id").Value, outDir);
+            Assert.True(rId.IsSuccess);
+            Assert.Equal("Fig_Sem_1.png", Path.GetFileName(rId.Value.OutputImagePath));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    private static byte[] BuildTablesBoxesAndFiguresPdfBytes()
+    {
+        // PDF coords (origin bottom-left, 612x792):
+        // 1. Gridded table (top): y=610..730 (rendered top y=62..182)
+        // 2. Callout box with tinted background + border + prose (middle): y=430..550
+        // 3. Real visual diagram Fig. 2.1 (lower-left): y=140..330, caption y=115
+        // 4. Prose cross-ref at bottom: y=55 ("Figure 9.9 shows unrelated background text.")
+        var sb = new StringBuilder();
+        // Gridded Table 1.1
+        sb.Append("BT /F1 11 Tf 60 742 Td (Table 1.1: Cellular ATP Metrics) Tj ET\n");
+        sb.Append("0.1 0.1 0.1 RG 1 w\n");
+        foreach (int y in new[] { 610, 640, 670, 700, 730 })
+            sb.Append($"60 {y} m 540 {y} l S\n");
+        foreach (int x in new[] { 60, 220, 380, 540 })
+            sb.Append($"{x} 610 m {x} 730 l S\n");
+        sb.Append("BT /F1 10 Tf 75 710 Td (Metric) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 235 710 Td (Baseline) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 395 710 Td (Ischemia) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 75 680 Td (ATP) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 235 680 Td (100%) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 395 680 Td (12%) Tj ET\n");
+
+        // Shaded callout box Box 1.1
+        sb.Append("0.92 0.94 0.98 rg 60 440 480 110 re f\n");
+        sb.Append("0.20 0.35 0.65 RG 1.5 w 60 440 480 110 re S\n");
+        sb.Append("0 0 0 rg\n");
+        sb.Append("BT /F1 11 Tf 75 525 Td (Box 1.1: Key Clinical Features of Injury) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 75 500 Td (Intracellular ATP depletion rapidly impairs membrane pumps and triggers swelling.) Tj ET\n");
+        sb.Append("BT /F1 10 Tf 75 480 Td (Reversible injury transitions to necrosis when mitochondria lose membrane potential.) Tj ET\n");
+
+        // Real colored vector diagram Fig. 2.1
+        sb.Append("0.15 0.45 0.80 rg 80 240 130 60 re f\n");
+        sb.Append("0.85 0.30 0.25 rg 280 240 130 60 re f\n");
+        sb.Append("0.20 0.70 0.40 rg 180 155 130 55 re f\n");
+        sb.Append("0.1 0.1 0.1 RG 2 w 210 270 m 280 270 l S 245 270 m 245 210 l S\n");
+        sb.Append("0 0 0 rg\n");
+        sb.Append("BT /F1 11 Tf 105 266 Td (Initiator) Tj ET\n");
+        sb.Append("BT /F1 11 Tf 305 266 Td (Adapter) Tj ET\n");
+        sb.Append("BT /F1 11 Tf 205 178 Td (Caspase) Tj ET\n");
+        sb.Append("BT /F1 11 Tf 80 125 Td (Fig. 2.1: Caspase signaling cascade in apoptosis.) Tj ET\n");
+
+        // Inline prose cross-ref that must NOT create a candidate
+        sb.Append("BT /F1 10 Tf 60 55 Td (Figure 9.9 shows unrelated prose discussion of pathways.) Tj ET\n");
+
+        byte[] pBytes = Encoding.Latin1.GetBytes(sb.ToString());
+        using var pdf = new MemoryStream();
+        void W(string s) { var b = Encoding.Latin1.GetBytes(s); pdf.Write(b, 0, b.Length); }
+        W("%PDF-1.4\n");
+        var offs = new List<long>();
+        void Obj(int id) { offs.Add(pdf.Position); W($"{id} 0 obj\n"); }
+        Obj(1); W("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        Obj(2); W("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n");
+        Obj(3); W("<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n");
+        Obj(4); W("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+        Obj(5); W($"<< /Length {pBytes.Length} >>\nstream\n");
+        pdf.Write(pBytes, 0, pBytes.Length);
+        W("\nendstream\nendobj\n");
+        long xref = pdf.Position;
+        W($"xref\n0 {offs.Count + 1}\n0000000000 65535 f \n");
+        foreach (var o in offs) W($"{o:D10} 00000 n \n");
+        W($"trailer\n<< /Size {offs.Count + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n");
+        return pdf.ToArray();
     }
 
     private static (int Width, int Height, byte[] Rgb) DecodePngRgbForTest(byte[] pngBytes)

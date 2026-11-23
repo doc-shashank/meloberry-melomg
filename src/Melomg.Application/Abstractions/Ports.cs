@@ -25,7 +25,8 @@ public sealed record FigureOwnerContext(PdfDocument Document, DocumentFigure Fig
 
 public sealed record DocumentListItem(
     string DocumentId, string Title, int PageCount, int FigureCount, string ModelName,
-    double ConfidenceThreshold, string StorageDirectory, DateTimeOffset IngestedAtUtc, string WorkspaceMode = "standard");
+    double ConfidenceThreshold, string StorageDirectory, DateTimeOffset IngestedAtUtc,
+    string WorkspaceMode = "standard", string? VocabPrimaryPrefix = null);
 
 public interface IDocumentWorkspaceRepository
 {
@@ -58,7 +59,8 @@ public interface IOnnxModelInspector
 
 public sealed record DetectedFigureCandidate(
     int PageNumber, FigureCategory Category, BoundingBox BoundingBox, double Confidence,
-    string? Caption, string? Label, DetectionSource Source, BoundingBox? CaptionBoundingBox = null);
+    string? Caption, string? Label, DetectionSource Source, BoundingBox? CaptionBoundingBox = null,
+    string? VocabPrefix = null, string? FigureNumber = null);
 
 public sealed record RenderedRgbBitmap(int Width, int Height, int Dpi, byte[] RgbPixels, string RenderEngine);
 
@@ -103,7 +105,8 @@ public interface IPageSnapshotExporter
 public sealed record PdfIngestionAnalysis(
     string SuggestedTitle, string Sha256Hash, IReadOnlyList<PdfPageInfo> Pages,
     IReadOnlyList<DetectedFigureCandidate> Candidates, OnnxModelMetadata ModelUsed,
-    double EffectiveConfidenceThreshold, string InferenceEngine = "managed-fallback");
+    double EffectiveConfidenceThreshold, string InferenceEngine = "managed-fallback",
+    DocumentVocabulary? Vocabulary = null, IReadOnlyList<string>? ScannedVocabPrefixes = null);
 
 public sealed record OnnxRuntimeInstallRequest(string Provider = "directml", bool IncludeModel = true, bool Force = false);
 
@@ -142,7 +145,8 @@ public sealed record ExtractedFigureArtifact(
     string FigureId, int Index, int PageNumber, string OutputImagePath, string? MetadataJsonPath,
     string Format, int Dpi, int PaddingPx, int PixelWidth, int PixelHeight, long FileSizeBytes,
     bool IncludedCaption, string RenderEngine, IReadOnlyList<AppliedMaskInfo> AppliedMasks,
-    int Quality = ExtractionOptions.DefaultQuality);
+    int Quality = ExtractionOptions.DefaultQuality, string? FigureNumber = null, string? Label = null,
+    string? Caption = null, double Confidence = 0, string? Category = null);
 
 public interface IFigureImageExtractor
 {
@@ -150,5 +154,7 @@ public interface IFigureImageExtractor
         PdfDocument document, DocumentFigure figure, ExtractionOptions options, string outputDirectory, CancellationToken cancellationToken = default);
     Task<Result<IReadOnlyList<ExtractedFigureArtifact>>> ExtractFiguresAsync(
         PdfDocument document, IReadOnlyList<DocumentFigure> figures, ExtractionOptions options, string outputDirectory, CancellationToken cancellationToken = default);
+    Task<Result<string>> WriteManifestAsync(
+        PdfDocument document, IReadOnlyList<ExtractedFigureArtifact> artifacts, string outputDirectory, CancellationToken cancellationToken = default);
     Task<Result> VerifyExtractedImageAsync(string imagePath, CancellationToken cancellationToken = default);
 }

@@ -509,19 +509,22 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
         string rawLabel = classId >= 0 && classId < labels.Count ? labels[classId] : "figure";
         string lower = rawLabel.Trim().ToLowerInvariant();
 
-        if (lower.Contains("caption", StringComparison.Ordinal)) { captions.Add((normBox, score)); return; }
-        if (lower is "title" or "plain text" or "text" or "abandon" or "table_footnote" or "footnote" or
-            "page-header" or "page-footer" or "section-header" or "list-item") return;
-
-        FigureCategory category = lower switch
+        if (lower is "figure_caption" or "picture_caption" or "image_caption" or "diagram_caption" or "chart_caption" or "caption")
         {
-            var s when s.Contains("table", StringComparison.Ordinal) => FigureCategory.Table,
-            var s when s.Contains("formula", StringComparison.Ordinal) || s.Contains("equation", StringComparison.Ordinal) => FigureCategory.Formula,
-            var s when s.Contains("chart", StringComparison.Ordinal) => FigureCategory.Chart,
-            var s when s.Contains("diagram", StringComparison.Ordinal) => FigureCategory.Diagram,
-            _ => FigureCategory.Figure
-        };
+            captions.Add((normBox, score));
+            return;
+        }
 
-        figures.Add((normBox, score, category, rawLabel));
+        // Strict visual-image/diagram allowlist: tables, formulas, callout boxes, and text classes are never emitted.
+        FigureCategory? category = lower switch
+        {
+            "figure" or "picture" or "image" or "photo" or "illustration" or "graphic" => FigureCategory.Figure,
+            "diagram" or "flowchart" or "schematic" => FigureCategory.Diagram,
+            "chart" or "plot" or "graph" => FigureCategory.Chart,
+            _ => null
+        };
+        if (category is null) return;
+
+        figures.Add((normBox, score, category.Value, rawLabel));
     }
 }

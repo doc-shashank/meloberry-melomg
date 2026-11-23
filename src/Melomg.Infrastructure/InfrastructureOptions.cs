@@ -41,7 +41,8 @@ public sealed class MelomgStorageOptions
 
     private static string ResolveDefaultAppDataDirectory()
     {
-        var overrideDir = Environment.GetEnvironmentVariable("MELOMG_APPDATA");
+        var overrideDir = Environment.GetEnvironmentVariable("MELOMG_APP_DATA")
+            ?? Environment.GetEnvironmentVariable("MELOMG_APPDATA");
         return !string.IsNullOrWhiteSpace(overrideDir)
             ? Path.GetFullPath(overrideDir)
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Meloberry");

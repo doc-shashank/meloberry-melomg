@@ -7,22 +7,21 @@ namespace Melomg.Cli.Commands;
 
 public sealed class RuntimeCliCommand : CliCommand
 {
+    private const string UsageText = "runtime <status|install|uninstall> [--provider directml|cpu] [--skip-model] [--keep-model] [--force]";
+
     public RuntimeCliCommand()
         : base(new CommandDescriptor(
             Verb: "runtime",
-            Usage: "runtime <status|install|uninstall> [--provider <directml|cpu>] [--skip-model] [--keep-model] [--force] [--yes]",
+            Usage: UsageText,
             Description: "Inspects, installs, or deletes AppData-hosted ONNX Runtime native binaries and pretrained DocLayout-YOLO weights.",
-            AcceptsLeadingTargetId: false,
             HandlerType: typeof(Handler),
             Category: CommandCategory.Models,
-            DetailedNotes: "Subcommands:\n  runtime status                                          Shows installed ONNX Runtime binaries, DirectML/CPU engine, and AppData paths.\n  runtime install [--provider <directml|cpu>] [--skip-model] [--force]  Downloads native ONNX Runtime DLLs (plus DocLayout-YOLO model unless --skip-model) into AppData.\n  runtime uninstall [--keep-model] [--yes]                Removes downloaded ONNX Runtime DLLs, DirectML redistributable, and pretrained model (unless --keep-model), reverting to managed fallback.",
             Examples:
             [
                 "melomg runtime status",
                 "melomg runtime install",
                 "melomg runtime install --provider cpu --skip-model",
-                "melomg --yes runtime uninstall",
-                "melomg runtime uninstall --keep-model"
+                "melomg runtime uninstall"
             ]))
     {
     }
@@ -35,7 +34,7 @@ public sealed class RuntimeCliCommand : CliCommand
         public async Task<int> InvokeAsync(CliInvocationContext context)
         {
             if (context.PositionalArgs.Count == 0)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: runtime <status|install|uninstall> ...", context.GlobalOptions.Json);
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
 
             string sub = context.PositionalArgs[0].Trim().ToLowerInvariant();
             switch (sub)
@@ -77,32 +76,6 @@ public sealed class RuntimeCliCommand : CliCommand
                 case "uninstall":
                 {
                     bool keepModel = context.NamedOptions.ContainsKey("keep-model");
-                    var currentRes = await getStatus.HandleAsync(new GetRuntimeStatusQuery(), context.CancellationToken);
-                    var current = currentRes.IsSuccess ? currentRes.Value : null;
-
-                    if (current is not null && !current.IsInstalled && current.Files.Count == 0 && (keepModel || !current.PretrainedModelInstalled))
-                    {
-                        var emptyRes = await uninstallRuntime.HandleAsync(new UninstallRuntimeCommand(keepModel), context.CancellationToken);
-                        if (!emptyRes.IsSuccess)
-                            return emptyRes.ToExitCode(context.Console, context.GlobalOptions.Json);
-
-                        CliCommandHelpers.WriteOutput(context, emptyRes.Value, "ONNX Runtime is not currently installed in AppData.");
-                        return ExitCodes.Success;
-                    }
-
-                    if (current is not null)
-                    {
-                        double mb = current.TotalInstalledBytes / (1024.0 * 1024.0);
-                        string scope = keepModel ? "ONNX Runtime DLLs" : "ONNX Runtime DLLs + pretrained DocLayout-YOLO model";
-                        context.Console.Error.WriteLine($"WARNING: Will delete {scope} ({current.Files.Count} file(s), {mb:F2} MB) from '{current.RuntimeDirectory}'.");
-                    }
-
-                    if (!CliCommandHelpers.ConfirmDeletion(context))
-                    {
-                        CliCommandHelpers.WriteOutput(context, new RuntimeUninstallAbortedPayload(true, "runtime uninstall"), "Runtime uninstallation cancelled.");
-                        return ExitCodes.Success;
-                    }
-
                     var res = await uninstallRuntime.HandleAsync(new UninstallRuntimeCommand(keepModel), context.CancellationToken);
                     if (!res.IsSuccess)
                         return res.ToExitCode(context.Console, context.GlobalOptions.Json);

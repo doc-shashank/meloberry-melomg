@@ -1,4 +1,5 @@
 using Melomg.Application.Abstractions;
+using Melomg.Application.Addressing;
 using Melomg.Domain.Common;
 using Melomg.Domain.Documents;
 using Melomg.Domain.Errors;
@@ -32,13 +33,14 @@ internal static class FigureUseCaseHelpers
     }
 
     public static async Task<Result<TResponse>> MutateFigureConditionalAsync<TResponse>(
-        IDocumentWorkspaceRepository repository, string figureId,
+        AddressResolver resolver, IDocumentWorkspaceRepository repository, string address,
         Func<FigureOwnerContext, Result<(TResponse Response, bool ShouldSave)>> mutate,
         CancellationToken cancellationToken)
     {
-        var owner = await repository.FindFigureOwnerAsync(figureId, cancellationToken);
-        if (owner is null) return FigureErrors.NotFound(figureId);
+        var ownerRes = await resolver.ResolveSingleFigureAsync(address, cancellationToken);
+        if (!ownerRes.IsSuccess) return ownerRes.Error!;
 
+        var owner = ownerRes.Value;
         var res = mutate(owner);
         if (!res.IsSuccess) return res.Error!;
 
@@ -49,10 +51,10 @@ internal static class FigureUseCaseHelpers
     }
 
     public static Task<Result<TResponse>> MutateFigureAsync<TResponse>(
-        IDocumentWorkspaceRepository repository, string figureId,
+        AddressResolver resolver, IDocumentWorkspaceRepository repository, string address,
         Func<FigureOwnerContext, Result<TResponse>> mutate,
         CancellationToken cancellationToken) =>
-        MutateFigureConditionalAsync<TResponse>(repository, figureId, owner =>
+        MutateFigureConditionalAsync<TResponse>(resolver, repository, address, owner =>
         {
             var res = mutate(owner);
             return res.IsSuccess ? (res.Value, true) : res.Error!;
@@ -63,33 +65,34 @@ public sealed record FigureMaskDto(int Index, BoundingBox BoundingBoxPts, string
 
 public sealed record DetectedLabelDto(int Index, string Text, BoundingBox BoundingBoxPts, double FontSize);
 
-public sealed record ListFigureMasksQuery(string FigureId);
+public sealed record ListFigureMasksQuery(string Address);
 
 public sealed record ListFigureMasksResponse(
     string FigureId, int PageNumber, IReadOnlyList<FigureMaskDto> SavedMasks, IReadOnlyList<DetectedLabelDto> DetectedLabels);
 
-public sealed class ListFigureMasksHandler(IDocumentWorkspaceRepository repository, IFigureLabelDetector labelDetector)
+public sealed class ListFigureMasksHandler(AddressResolver resolver, IFigureLabelDetector labelDetector)
 {
     public async Task<Result<ListFigureMasksResponse>> HandleAsync(ListFigureMasksQuery query, CancellationToken cancellationToken = default)
     {
-        var owner = await repository.FindFigureOwnerAsync(query.FigureId, cancellationToken);
-        if (owner is null) return FigureErrors.NotFound(query.FigureId);
+        var ownerRes = await resolver.ResolveSingleFigureAsync(query.Address, cancellationToken);
+        if (!ownerRes.IsSuccess) return ownerRes.Error!;
 
+        var owner = ownerRes.Value;
         var (saved, detected) = await FigureUseCaseHelpers.LoadMasksAndDetectedLabelsAsync(owner, labelDetector, cancellationToken);
         return new ListFigureMasksResponse(owner.Figure.Id, owner.Figure.PageNumber, saved, detected);
     }
 }
 
 public sealed record AddFigureMaskCommand(
-    string FigureId, double X, double Y, double Width, double Height,
+    string Address, double X, double Y, double Width, double Height,
     string? LabelText = null, string? Style = null, string? ColorHex = null);
 
 public sealed record AddFigureMaskResponse(string FigureId, int PageNumber, FigureMaskDto AddedMask, int TotalMasks);
 
-public sealed class AddFigureMaskHandler(IDocumentWorkspaceRepository repository)
+public sealed class AddFigureMaskHandler(AddressResolver resolver, IDocumentWorkspaceRepository repository)
 {
     public Task<Result<AddFigureMaskResponse>> HandleAsync(AddFigureMaskCommand command, CancellationToken cancellationToken = default) =>
-        FigureUseCaseHelpers.MutateFigureAsync<AddFigureMaskResponse>(repository, command.FigureId, owner =>
+        FigureUseCaseHelpers.MutateFigureAsync<AddFigureMaskResponse>(resolver, repository, command.Address, owner =>
         {
             var page = owner.Document.GetPage(owner.Figure.PageNumber);
             if (page is null) return DocumentErrors.InvalidPageNumber(owner.Figure.PageNumber, owner.Document.PageCount);
@@ -112,17 +115,18 @@ public sealed class AddFigureMaskHandler(IDocumentWorkspaceRepository repository
         }, cancellationToken);
 }
 
-public sealed record AutoMaskFigureLabelsCommand(string FigureId, string? MatchPatterns = null, string? Style = null, string? ColorHex = null);
+public sealed record AutoMaskFigureLabelsCommand(string Address, string? MatchPatterns = null, string? Style = null, string? ColorHex = null);
 
 public sealed record AutoMaskFigureLabelsResponse(string FigureId, int AddedCount, int TotalMasks, IReadOnlyList<FigureMaskDto> AddedMasks);
 
-public sealed class AutoMaskFigureLabelsHandler(IDocumentWorkspaceRepository repository, IFigureLabelDetector labelDetector)
+public sealed class AutoMaskFigureLabelsHandler(AddressResolver resolver, IDocumentWorkspaceRepository repository, IFigureLabelDetector labelDetector)
 {
     public async Task<Result<AutoMaskFigureLabelsResponse>> HandleAsync(AutoMaskFigureLabelsCommand command, CancellationToken cancellationToken = default)
     {
-        var owner = await repository.FindFigureOwnerAsync(command.FigureId, cancellationToken);
-        if (owner is null) return FigureErrors.NotFound(command.FigureId);
+        var ownerRes = await resolver.ResolveSingleFigureAsync(command.Address, cancellationToken);
+        if (!ownerRes.IsSuccess) return ownerRes.Error!;
 
+        var owner = ownerRes.Value;
         var (doc, fig) = (owner.Document, owner.Figure);
         var page = doc.GetPage(fig.PageNumber);
         if (page is null) return DocumentErrors.InvalidPageNumber(fig.PageNumber, doc.PageCount);
@@ -165,14 +169,14 @@ public sealed class AutoMaskFigureLabelsHandler(IDocumentWorkspaceRepository rep
     }
 }
 
-public sealed record RemoveFigureMaskCommand(string FigureId, int MaskIndex);
+public sealed record RemoveFigureMaskCommand(string Address, int MaskIndex);
 
 public sealed record RemoveFigureMaskResponse(string FigureId, int RemovedMaskIndex, int RemainingMasks);
 
-public sealed class RemoveFigureMaskHandler(IDocumentWorkspaceRepository repository)
+public sealed class RemoveFigureMaskHandler(AddressResolver resolver, IDocumentWorkspaceRepository repository)
 {
     public Task<Result<RemoveFigureMaskResponse>> HandleAsync(RemoveFigureMaskCommand command, CancellationToken cancellationToken = default) =>
-        FigureUseCaseHelpers.MutateFigureAsync<RemoveFigureMaskResponse>(repository, command.FigureId, owner =>
+        FigureUseCaseHelpers.MutateFigureAsync<RemoveFigureMaskResponse>(resolver, repository, command.Address, owner =>
         {
             var res = owner.Figure.RemoveLabelMask(command.MaskIndex);
             return res.IsSuccess
@@ -181,14 +185,14 @@ public sealed class RemoveFigureMaskHandler(IDocumentWorkspaceRepository reposit
         }, cancellationToken);
 }
 
-public sealed record ClearFigureMasksCommand(string FigureId);
+public sealed record ClearFigureMasksCommand(string Address);
 
 public sealed record ClearFigureMasksResponse(string FigureId, int ClearedCount);
 
-public sealed class ClearFigureMasksHandler(IDocumentWorkspaceRepository repository)
+public sealed class ClearFigureMasksHandler(AddressResolver resolver, IDocumentWorkspaceRepository repository)
 {
     public Task<Result<ClearFigureMasksResponse>> HandleAsync(ClearFigureMasksCommand command, CancellationToken cancellationToken = default) =>
-        FigureUseCaseHelpers.MutateFigureConditionalAsync<ClearFigureMasksResponse>(repository, command.FigureId, owner =>
+        FigureUseCaseHelpers.MutateFigureConditionalAsync<ClearFigureMasksResponse>(resolver, repository, command.Address, owner =>
         {
             int cleared = owner.Figure.ClearLabelMasks();
             return (new ClearFigureMasksResponse(owner.Figure.Id, cleared), cleared > 0);

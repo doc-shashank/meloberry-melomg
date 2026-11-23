@@ -3,7 +3,9 @@ using Melomg.Application.Abstractions;
 using Melomg.Application.UseCases.Diagnostics;
 using Melomg.Application.UseCases.Documents;
 using Melomg.Application.UseCases.Extraction;
+using Melomg.Domain.Documents;
 using Melomg.Infrastructure;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -12,7 +14,7 @@ namespace Melomg.UnitTests;
 public sealed class WorkspaceAndLintTests
 {
     [Fact]
-    public async Task SqliteWorkspace_RoundTrip_AutoDiscovery_Reanalyze_And_LintFailureDetection()
+    public async Task SqliteWorkspace_RoundTrip_AutoDiscovery_Refresh_And_LintFailureDetection()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "melomg_ws_" + Guid.NewGuid().ToString("N"));
         var appDataA = Path.Combine(tempRoot, "appdata_a");
@@ -38,9 +40,10 @@ public sealed class WorkspaceAndLintTests
                 var res = await ingest.HandleAsync(new IngestPdfCommand(pdfPath, workDir, RetainDatabase: true));
                 Assert.True(res.IsSuccess);
                 Assert.True(res.Value.RetainDatabase);
-                docId = res.Value.DocumentId;
-                Assert.NotNull(res.Value.FirstFigureId);
-                firstFigId = res.Value.FirstFigureId!;
+                docId = res.Value.Id;
+                Assert.NotNull(res.Value.Figures);
+                Assert.NotEmpty(res.Value.Figures!);
+                firstFigId = res.Value.Figures![0].Id;
                 Assert.False(File.Exists(Path.Combine(workDir, docId, "source.pdf")));
 
                 var render = scope.ServiceProvider.GetRequiredService<RenderPagesHandler>();
@@ -61,7 +64,8 @@ public sealed class WorkspaceAndLintTests
                 Assert.Equal(1, extRes.Value.CleanedOverlayCount);
                 Assert.False(File.Exists(overlayFile));
                 Assert.False(Directory.Exists(qaOverlayDir));
-                extractedPng = extRes.Value.Artifacts[0].OutputImagePath;
+                Assert.NotNull(extRes.Value.Artifacts);
+                extractedPng = extRes.Value.Artifacts![0].OutputImagePath;
                 Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(extractedPng)!, "*.meta.json"));
 
                 var lint = scope.ServiceProvider.GetRequiredService<LintDocumentHandler>();
@@ -81,25 +85,27 @@ public sealed class WorkspaceAndLintTests
                 Assert.Single(listRes.Value);
                 Assert.Equal(docId, listRes.Value[0].DocumentId);
 
-                // Reanalyze with strict high threshold (0.99) drops lower-confidence items
-                var reanalyze = scope.ServiceProvider.GetRequiredService<ReanalyzeDocumentHandler>();
-                var reRes = await reanalyze.HandleAsync(new ReanalyzeDocumentCommand(docId, ConfidenceThreshold: 0.99));
+                // Refresh with strict high threshold (0.99) drops lower-confidence items
+                var ingestB = scope.ServiceProvider.GetRequiredService<IngestPdfHandler>();
+                var reRes = await ingestB.HandleAsync(new IngestPdfCommand(docId, Refresh: true, ConfidenceThreshold: 0.99));
                 Assert.True(reRes.IsSuccess);
                 Assert.True(reRes.Value.FigureCount <= reRes.Value.PreviousFigureCount);
 
-                // Restore figures by reanalyzing at 0.35
-                var restoreRes = await reanalyze.HandleAsync(new ReanalyzeDocumentCommand(docId, ConfidenceThreshold: 0.35));
+                // Restore figures by refreshing at 0.35
+                var restoreRes = await ingestB.HandleAsync(new IngestPdfCommand(docId, Refresh: true, ConfidenceThreshold: 0.35));
                 Assert.True(restoreRes.IsSuccess);
                 Assert.True(restoreRes.Value.FigureCount >= 3);
 
                 // Corrupt extracted image and verify Lint detects Lint.BrokenExtractedImage
-                var info = await scope.ServiceProvider.GetRequiredService<GetDocumentInfoHandler>()
-                    .HandleAsync(new GetDocumentInfoQuery(docId));
-                string activeFig = info.Value.ActiveFigureId!;
+                var info = await scope.ServiceProvider.GetRequiredService<GetTargetHandler>()
+                    .HandleAsync(new GetTargetQuery(docId, ViewMode.Outline));
+                Assert.True(info.IsSuccess);
+                string activeFig = info.Value.Figures![0].Id;
                 var ext2 = await scope.ServiceProvider.GetRequiredService<ExtractFiguresHandler>()
                     .HandleAsync(new ExtractFiguresCommand(activeFig));
                 Assert.True(ext2.IsSuccess);
-                await File.WriteAllTextAsync(ext2.Value.Artifacts[0].OutputImagePath, "NOT_PNG");
+                Assert.NotNull(ext2.Value.Artifacts);
+                await File.WriteAllTextAsync(ext2.Value.Artifacts![0].OutputImagePath, "NOT_PNG");
 
                 var lintAfter = await scope.ServiceProvider.GetRequiredService<LintDocumentHandler>()
                     .HandleAsync(new LintDocumentQuery(docId));
@@ -110,19 +116,12 @@ public sealed class WorkspaceAndLintTests
         }
         finally
         {
-            try
-            {
-                if (Directory.Exists(tempRoot))
-                    Directory.Delete(tempRoot, recursive: true);
-            }
-            catch
-            {
-            }
+            TryDelete(tempRoot);
         }
     }
 
     [Fact]
-    public async Task EphemeralIngest_DiscardsDbAfterExtract_WhileOpenProject_MovesPdfAndRetainsDb()
+    public async Task EphemeralIngest_DiscardsDbAfterExtract_WhileProjectIngest_MovesPdfAndRetainsDb()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "melomg_proj_" + Guid.NewGuid().ToString("N"));
         var appData = Path.Combine(tempRoot, "appdata");
@@ -152,55 +151,54 @@ public sealed class WorkspaceAndLintTests
             Assert.True(Directory.Exists(ingRes.Value.WorkspaceDirectory));
 
             var extract = scope.ServiceProvider.GetRequiredService<ExtractFiguresHandler>();
-            var extRes = await extract.HandleAsync(new ExtractFiguresCommand(ingRes.Value.DocumentId, Selector: "all", OutputDirectory: outDir));
+            var extRes = await extract.HandleAsync(new ExtractFiguresCommand(ingRes.Value.Id, Selectors: ["all"], OutputDirectory: outDir));
             Assert.True(extRes.IsSuccess);
             Assert.False(extRes.Value.RetainedDatabase);
-            Assert.NotEmpty(Directory.GetFiles(outDir, "*.png"));
+            Assert.NotEmpty(Directory.GetFiles(outDir, "fig_*.png"));
             Assert.False(Directory.Exists(ingRes.Value.WorkspaceDirectory));
             Assert.Empty(Directory.GetFiles(workDir, "*.db", SearchOption.AllDirectories));
             Assert.True(File.Exists(ephPdf));
 
-            // 2. Open PDF as project without projectDir -> moves PDF into <CWD>/project_<PDF name>/ and keeps DB forever
+            // 2. Project ingest without dir -> moves PDF into <CWD>/project_<PDF name>/ and keeps DB forever
             var projSourcePdf = Path.Combine(tempRoot, "My Anatomy Chapter.pdf");
             await File.WriteAllBytesAsync(projSourcePdf, OnnxAndPdfIngestionTests.BuildSampleMultiPagePdfBytes());
 
-            var open = scope.ServiceProvider.GetRequiredService<OpenProjectHandler>();
-            var openRes = await open.HandleAsync(new OpenProjectCommand(projSourcePdf, Offline: true));
+            var openRes = await ingest.HandleAsync(new IngestPdfCommand(projSourcePdf, ProjectMode: true, Offline: true));
             Assert.True(openRes.IsSuccess);
             Assert.False(openRes.Value.ReopenedExisting);
 
             string expectedProjectDir = Path.Combine(cwdDir, "project_My Anatomy Chapter");
             string expectedMovedPdf = Path.Combine(expectedProjectDir, "My Anatomy Chapter.pdf");
-            Assert.Equal(expectedProjectDir, openRes.Value.ProjectDirectory);
+            Assert.Equal(expectedProjectDir, openRes.Value.WorkspaceDirectory);
             Assert.Equal(expectedMovedPdf, openRes.Value.StoredPdfPath);
             Assert.False(File.Exists(projSourcePdf));
             Assert.True(File.Exists(expectedMovedPdf));
             Assert.True(File.Exists(openRes.Value.DatabasePath));
 
             // Extracting without --retain-db STILL keeps project DB intact
-            var projExtRes = await extract.HandleAsync(new ExtractFiguresCommand(openRes.Value.DocumentId, Selector: "all"));
+            var projExtRes = await extract.HandleAsync(new ExtractFiguresCommand(openRes.Value.Id, Selectors: ["all"]));
             Assert.True(projExtRes.IsSuccess);
             Assert.True(projExtRes.Value.RetainedDatabase);
             Assert.True(File.Exists(openRes.Value.DatabasePath));
 
             // Re-opening existing project directory loads it without re-ingesting
-            var reopenRes = await open.HandleAsync(new OpenProjectCommand(expectedProjectDir));
+            var reopenRes = await ingest.HandleAsync(new IngestPdfCommand(expectedProjectDir, ProjectMode: true));
             Assert.True(reopenRes.IsSuccess);
             Assert.True(reopenRes.Value.ReopenedExisting);
-            Assert.Equal(openRes.Value.DocumentId, reopenRes.Value.DocumentId);
+            Assert.Equal(openRes.Value.Id, reopenRes.Value.Id);
 
-            // listdocs discovers the project workspace in CWD
+            // ls discovers the project workspace in CWD
             var listRes = await scope.ServiceProvider.GetRequiredService<ListDocumentsHandler>()
                 .HandleAsync(new ListDocumentsQuery(cwdDir));
             Assert.True(listRes.IsSuccess);
-            Assert.Contains(listRes.Value, d => d.DocumentId == openRes.Value.DocumentId && d.WorkspaceMode == "project");
+            Assert.Contains(listRes.Value, d => d.DocumentId == openRes.Value.Id && d.WorkspaceMode == "project");
 
-            // BUG-05: Deleting underlying DB causes listdocs to prune the missing registry entry cleanly
-            File.Delete(openRes.Value.DatabasePath);
+            // Deleting underlying DB causes ls to prune the missing registry entry cleanly
+            File.Delete(openRes.Value.DatabasePath!);
             var prunedList = await scope.ServiceProvider.GetRequiredService<ListDocumentsHandler>()
                 .HandleAsync(new ListDocumentsQuery(cwdDir));
             Assert.True(prunedList.IsSuccess);
-            Assert.DoesNotContain(prunedList.Value, d => d.DocumentId == openRes.Value.DocumentId);
+            Assert.DoesNotContain(prunedList.Value, d => d.DocumentId == openRes.Value.Id);
 
             // SEC-01: QA overlay cleanup never deletes non-image spoofed _overlay.png or unrelated files
             var secPdf = Path.Combine(tempRoot, "sec.pdf");
@@ -210,28 +208,71 @@ public sealed class WorkspaceAndLintTests
             string spoofOverlay = Path.Combine(workDir, "fake_overlay.png");
             await File.WriteAllTextAsync(spoofOverlay, "NOT A REAL PNG");
             string validOverlay = (await scope.ServiceProvider.GetRequiredService<RenderPagesHandler>()
-                .HandleAsync(new RenderPagesCommand(secIngest.Value.DocumentId, 1, false, workDir, "png", 96, Overlay: true)))
+                .HandleAsync(new RenderPagesCommand(secIngest.Value.Id, 1, false, workDir, "png", 96, Overlay: true)))
                 .Value.Artifacts[0].OutputImagePath;
             Assert.True(File.Exists(validOverlay));
 
-            // Manually plant spoofed overlay path in qa_overlays.txt to verify magic-byte gate on cleanup
-            string manifestPath = Path.Combine(secIngest.Value.WorkspaceDirectory, "qa_overlays.txt");
+            // Manually plant spoofed overlay path in .qa_overlays to verify magic-byte gate on cleanup
+            string manifestPath = Path.Combine(secIngest.Value.WorkspaceDirectory, ".qa_overlays");
             await File.AppendAllTextAsync(manifestPath, Environment.NewLine + spoofOverlay + Environment.NewLine);
-            var secExtract = await extract.HandleAsync(new ExtractFiguresCommand(secIngest.Value.DocumentId, Selector: "1", OutputDirectory: outDir));
+            var secExtract = await extract.HandleAsync(new ExtractFiguresCommand(secIngest.Value.Id, Selectors: ["f1"], OutputDirectory: outDir));
             Assert.True(secExtract.IsSuccess);
             Assert.False(File.Exists(validOverlay));
             Assert.True(File.Exists(spoofOverlay));
         }
         finally
         {
-            try
+            TryDelete(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task LegacyDatabaseWithTableOrFormulaRows_SkipsNonVisualArtifactsOnLoad()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "melomg_legacy_db_" + Guid.NewGuid().ToString("N"));
+        var appData = Path.Combine(tempRoot, "appdata");
+        var workDir = Path.Combine(tempRoot, "work");
+        Directory.CreateDirectory(workDir);
+
+        try
+        {
+            var pdfPath = Path.Combine(tempRoot, "legacy.pdf");
+            await File.WriteAllBytesAsync(pdfPath, OnnxAndPdfIngestionTests.BuildSampleMultiPagePdfBytes());
+
+            await using var sp = BuildProvider(appData);
+            using var scope = sp.CreateScope();
+
+            var ingest = scope.ServiceProvider.GetRequiredService<IngestPdfHandler>();
+            var res = await ingest.HandleAsync(new IngestPdfCommand(pdfPath, workDir, RetainDatabase: true, Offline: true));
+            Assert.True(res.IsSuccess);
+            string dbPath = res.Value.DatabasePath!;
+            int originalCount = res.Value.FigureCount;
+
+            // Inject legacy "Table" and "Formula" rows directly into SQLite
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
             {
-                if (Directory.Exists(tempRoot))
-                    Directory.Delete(tempRoot, recursive: true);
+                await conn.OpenAsync();
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = """
+                    INSERT INTO DocumentFigures (Id, SortIndex, PageNumber, PageFigureIndex, Category, BboxX, BboxY, BboxW, BboxH, Confidence, Source, Label, Caption)
+                    VALUES ('Fig_LegacyTable', 98, 1, 98, 'table', 20, 20, 100, 80, 0.90, 'onnx', 'Table 1', 'Table 1. Legacy table'),
+                           ('Fig_LegacyFormula', 99, 1, 99, 'formula', 20, 120, 100, 40, 0.90, 'onnx', 'Eq 1', 'Eq 1. Legacy formula');
+                    """;
+                await cmd.ExecuteNonQueryAsync();
             }
-            catch
-            {
-            }
+
+            var repo = scope.ServiceProvider.GetRequiredService<IDocumentWorkspaceRepository>();
+            var reloaded = await repo.FindDocumentAsync(res.Value.Id);
+            Assert.NotNull(reloaded);
+            Assert.Equal(originalCount, reloaded!.Document.Figures.Count);
+            Assert.DoesNotContain(reloaded.Document.Figures, f => f.Id is "Fig_LegacyTable" or "Fig_LegacyFormula");
+            Assert.All(reloaded.Document.Figures, f =>
+                Assert.True(f.Category is FigureCategory.Figure or FigureCategory.Diagram or FigureCategory.Chart));
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            TryDelete(tempRoot);
         }
     }
 
@@ -250,5 +291,17 @@ public sealed class WorkspaceAndLintTests
         services.AddApplication();
         services.AddInfrastructure(opts => opts.AppDataDirectory = appDataDir);
         return services.BuildServiceProvider();
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+        }
     }
 }

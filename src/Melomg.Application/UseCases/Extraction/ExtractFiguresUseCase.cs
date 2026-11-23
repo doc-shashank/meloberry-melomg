@@ -1,4 +1,6 @@
 using Melomg.Application.Abstractions;
+using Melomg.Application.Addressing;
+using Melomg.Application.UseCases.Documents;
 using Melomg.Domain.Common;
 using Melomg.Domain.Documents;
 using Melomg.Domain.Errors;
@@ -123,54 +125,100 @@ internal static class QaOverlayManifestHelper
 }
 
 public sealed record ExtractFiguresCommand(
-    string? TargetId, string? Selector = null, int? PageNumber = null, string? OutputDirectory = null,
-    string Format = "png", int? Dpi = null, int PaddingPx = ExtractionOptions.DefaultPaddingPx,
-    bool IncludeCaption = false, bool ObfuscateAllLabels = false, string? ObfuscateLabelPatterns = null,
-    bool IgnoreSavedMasks = false, string? ObfuscateStyle = null, string? ObfuscateColorHex = null,
-    string? Quality = null, bool IncludeMetadata = false, bool KeepOverlay = false, bool RetainDatabase = false);
+    string Target,
+    IReadOnlyList<string>? Selectors = null,
+    string? OutputDirectory = null,
+    string Format = "png",
+    int? Dpi = null,
+    int PaddingPx = ExtractionOptions.DefaultPaddingPx,
+    bool IncludeCaption = false,
+    bool ObfuscateAllLabels = false,
+    string? ObfuscateLabelPatterns = null,
+    bool IgnoreSavedMasks = false,
+    string? ObfuscateStyle = null,
+    string? ObfuscateColorHex = null,
+    string? Quality = null,
+    string NamingMode = ExtractionOptions.DefaultNamingMode,
+    bool IncludeMetadata = false,
+    bool KeepOverlay = false,
+    bool RetainDatabase = false,
+    bool Offline = false,
+    string? ModelPath = null,
+    double? ConfidenceThreshold = null,
+    bool EmitManifest = false,
+    bool Quiet = false,
+    bool Verbose = false);
 
 public sealed record ExtractFiguresResponse(
-    string DocumentId, string OutputDirectory, string Format, int Dpi, int PaddingPx, int Quality,
-    bool IncludeCaption, string RenderEngine, int ExtractedCount, IReadOnlyList<ExtractedFigureArtifact> Artifacts,
-    int CleanedOverlayCount = 0, bool RetainedDatabase = true);
+    string DocumentId,
+    string OutputDirectory,
+    string Format,
+    int Dpi,
+    int PaddingPx,
+    int Quality,
+    bool IncludeCaption,
+    string RenderEngine,
+    int ExtractedCount,
+    IReadOnlyList<ExtractedFigureArtifact>? Artifacts,
+    int CleanedOverlayCount = 0,
+    bool RetainedDatabase = true,
+    DocumentVocabularyDto? Vocab = null,
+    string? ManifestPath = null);
 
 public sealed class ExtractFiguresHandler(
-    IDocumentWorkspaceRepository repository, IFigureImageExtractor figureExtractor, IWorkingDirectoryProvider workingDirectoryProvider)
+    AddressResolver resolver,
+    IDocumentWorkspaceRepository repository,
+    IFigureImageExtractor figureExtractor,
+    IWorkingDirectoryProvider workingDirectoryProvider,
+    IIdGenerator idGenerator,
+    IModelSettingsRepository modelSettings,
+    IOnnxModelInspector modelInspector,
+    IPdfIngestionEngine pdfEngine,
+    IOnnxRuntimeManager runtimeManager)
 {
     public async Task<Result<ExtractFiguresResponse>> HandleAsync(ExtractFiguresCommand command, CancellationToken cancellationToken = default)
     {
         var optionsResult = ExtractionOptions.Create(
             command.Format, command.Dpi, command.PaddingPx, command.IncludeCaption, command.ObfuscateAllLabels,
             command.ObfuscateLabelPatterns, command.IgnoreSavedMasks, command.ObfuscateStyle, command.ObfuscateColorHex,
-            command.Quality, command.IncludeMetadata);
+            command.Quality, command.IncludeMetadata, command.NamingMode, command.EmitManifest);
         if (!optionsResult.IsSuccess) return optionsResult.Error!;
-        if (string.IsNullOrWhiteSpace(command.TargetId)) return DocumentErrors.NotFound(string.Empty);
+
+        if (string.IsNullOrWhiteSpace(command.Target))
+            return FigureErrors.InvalidAddress(string.Empty, "Target address or PDF path is required.");
 
         var options = optionsResult.Value;
-        PdfDocument document;
-        string workspaceStorageDir;
-        List<DocumentFigure> targets = [];
+        string target = command.Target.Trim();
 
-        if (command.TargetId.StartsWith("Fig_", StringComparison.Ordinal))
+        // One-shot PDF extraction when target is a PDF file path (or not a Doc_/Fig_ address)
+        bool looksLikeIdAddress = target.StartsWith("Doc_", StringComparison.Ordinal) || target.StartsWith("Fig_", StringComparison.Ordinal);
+        if (!looksLikeIdAddress)
+            return await HandleOneShotPdfAsync(target, command, options, cancellationToken);
+
+        var resolvedRes = await resolver.ResolveTargetAsync(target, cancellationToken);
+        if (!resolvedRes.IsSuccess) return resolvedRes.Error!;
+
+        var resolved = resolvedRes.Value;
+        var document = resolved.DocumentContext.Document;
+        string workspaceStorageDir = resolved.DocumentContext.StorageDirectory;
+        IReadOnlyList<DocumentFigure> targets;
+
+        if (resolved.Address.Kind == AddressKind.Document)
         {
-            var owner = await repository.FindFigureOwnerAsync(command.TargetId, cancellationToken);
-            if (owner is null) return FigureErrors.NotFound(command.TargetId);
-            document = owner.Document;
-            workspaceStorageDir = owner.StorageDirectory;
-            targets.Add(owner.Figure);
+            if (command.Selectors is null || command.Selectors.Count == 0)
+                return new Error("Cli.InvalidArgs", "Specify figure number(s) (e.g. '2.1'), 'all', or address '<docId>#<num>'.", ErrorType.Validation, Hint: $"Document '{document.Id}' has {document.Figures.Count} figure(s).");
+
+            var selRes = AddressResolver.ResolveSelectors(document, command.Selectors);
+            if (!selRes.IsSuccess) return selRes.Error!;
+            targets = selRes.Value;
         }
         else
         {
-            var lookup = await repository.FindDocumentAsync(command.TargetId, cancellationToken);
-            if (lookup is null) return DocumentErrors.NotFound(command.TargetId);
-            document = lookup.Document;
-            workspaceStorageDir = lookup.StorageDirectory;
-            var resolveResult = ResolveDocumentTargets(document, command.Selector, command.PageNumber);
-            if (!resolveResult.IsSuccess) return resolveResult.Error!;
-            targets.AddRange(resolveResult.Value);
+            targets = resolved.Figures;
         }
 
-        if (targets.Count == 0) return FigureErrors.NoFiguresMatch(command.Selector ?? command.TargetId);
+        if (targets.Count == 0)
+            return FigureErrors.NoFiguresMatch(target);
 
         string outDir = string.IsNullOrWhiteSpace(command.OutputDirectory)
             ? Path.Combine(workspaceStorageDir, "figures")
@@ -188,6 +236,14 @@ public sealed class ExtractFiguresHandler(
 
         await repository.SaveDocumentAsync(document, cancellationToken);
 
+        string? manifestPath = null;
+        if (options.EmitManifest)
+        {
+            var manRes = await figureExtractor.WriteManifestAsync(document, artifacts, outDir, cancellationToken);
+            if (!manRes.IsSuccess) return manRes.Error!;
+            manifestPath = manRes.Value;
+        }
+
         int cleanedOverlays = !command.KeepOverlay ? QaOverlayManifestHelper.Cleanup(workspaceStorageDir) : 0;
         bool retainDatabase = document.Mode == WorkspaceMode.Project || document.RetainDatabase || command.RetainDatabase;
         if (!retainDatabase) await repository.DiscardWorkspaceDatabaseAsync(document.Id, cancellationToken);
@@ -195,43 +251,94 @@ public sealed class ExtractFiguresHandler(
         return new ExtractFiguresResponse(
             document.Id, outDir, options.Format, options.Dpi, options.PaddingPx, options.Quality,
             options.IncludeCaption, artifacts.FirstOrDefault()?.RenderEngine ?? "windows-pdf",
-            artifacts.Count, artifacts, cleanedOverlays, retainDatabase);
+            artifacts.Count, command.Quiet ? null : artifacts, cleanedOverlays, retainDatabase,
+            DocumentVocabularyDto.FromDomain(document.Vocabulary), manifestPath);
     }
 
-    private static Result<IReadOnlyList<DocumentFigure>> ResolveDocumentTargets(PdfDocument document, string? selector, int? pageNumber)
+    private async Task<Result<ExtractFiguresResponse>> HandleOneShotPdfAsync(
+        string pdfTarget,
+        ExtractFiguresCommand command,
+        ExtractionOptions options,
+        CancellationToken cancellationToken)
     {
-        if (pageNumber.HasValue)
+        if (command.Selectors is null || command.Selectors.Count == 0)
+            return new Error("Cli.InvalidArgs", "One-shot PDF extraction requires figure number(s) (e.g. '2.1') or 'all'.", ErrorType.Validation, Hint: "Pass figure number(s) after the PDF path or run 'melomg ingest <pdf>' first.");
+
+        string fullPdfPath = Path.GetFullPath(pdfTarget);
+        var analysisResult = await ModelResolutionHelper.PrepareAndAnalyzePdfAsync(
+            fullPdfPath, command.ModelPath, command.ConfidenceThreshold, command.Offline,
+            runtimeManager, modelSettings, modelInspector, pdfEngine, cancellationToken);
+        if (!analysisResult.IsSuccess) return analysisResult.Error!;
+
+        var analysis = analysisResult.Value;
+        string docId = idGenerator.NewDocumentId();
+        string tempWorkspace = command.RetainDatabase
+            ? Path.Combine(workingDirectoryProvider.GetCurrentDirectory(), ".meloberry", "melomg", docId)
+            : Path.Combine(Path.GetTempPath(), $"melomg_oneshot_{docId}");
+
+        try
         {
-            if (document.GetPage(pageNumber.Value) is null) return DocumentErrors.InvalidPageNumber(pageNumber.Value, document.PageCount);
-            var pageFigs = document.Figures.Where(f => f.PageNumber == pageNumber.Value).ToList();
-            return pageFigs.Count > 0 ? pageFigs : FigureErrors.NoFiguresMatch($"page {pageNumber.Value}");
-        }
+            if (command.RetainDatabase)
+            {
+                var initRes = await pdfEngine.InitializeWorkspaceAsync(tempWorkspace, cancellationToken);
+                if (!initRes.IsSuccess) return initRes.Error!;
+            }
 
-        if (string.IsNullOrWhiteSpace(selector))
+            var docResult = PdfDocument.Create(
+                docId, analysis.SuggestedTitle, fullPdfPath, fullPdfPath, analysis.Sha256Hash, tempWorkspace,
+                analysis.ModelUsed.ModelName, analysis.EffectiveConfidenceThreshold, TimeProvider.System.GetUtcNow(),
+                analysis.Pages, WorkspaceMode.Standard, command.RetainDatabase, analysis.ScannedVocabPrefixes);
+            if (!docResult.IsSuccess) return docResult.Error!;
+
+            var document = docResult.Value;
+            var popRes = ModelResolutionHelper.PopulateFigures(document, analysis.Candidates, idGenerator);
+            if (!popRes.IsSuccess) return popRes.Error!;
+
+            var selRes = AddressResolver.ResolveSelectors(document, command.Selectors);
+            if (!selRes.IsSuccess) return selRes.Error!;
+
+            var targets = selRes.Value;
+            string outDir = string.IsNullOrWhiteSpace(command.OutputDirectory)
+                ? (command.RetainDatabase ? Path.Combine(tempWorkspace, "figures") : workingDirectoryProvider.GetCurrentDirectory())
+                : workingDirectoryProvider.NormalizeDirectoryPath(command.OutputDirectory);
+
+            var extractResult = await figureExtractor.ExtractFiguresAsync(document, targets, options, outDir, cancellationToken);
+            if (!extractResult.IsSuccess) return extractResult.Error!;
+
+            var artifacts = extractResult.Value;
+            if (command.RetainDatabase)
+            {
+                for (int i = 0; i < targets.Count && i < artifacts.Count; i++)
+                    targets[i].RecordExtraction(artifacts[i].OutputImagePath);
+                if (targets.Count == 1) document.ActivateFigure(targets[0].Id);
+                await repository.CreateDocumentAsync(document, cancellationToken);
+            }
+
+            string? manifestPath = null;
+            if (options.EmitManifest)
+            {
+                var manRes = await figureExtractor.WriteManifestAsync(document, artifacts, outDir, cancellationToken);
+                if (!manRes.IsSuccess) return manRes.Error!;
+                manifestPath = manRes.Value;
+            }
+
+            return new ExtractFiguresResponse(
+                document.Id, outDir, options.Format, options.Dpi, options.PaddingPx, options.Quality,
+                options.IncludeCaption, artifacts.FirstOrDefault()?.RenderEngine ?? "windows-pdf",
+                artifacts.Count, command.Quiet ? null : artifacts, CleanedOverlayCount: 0, RetainedDatabase: command.RetainDatabase,
+                DocumentVocabularyDto.FromDomain(document.Vocabulary), manifestPath);
+        }
+        finally
         {
-            if (string.IsNullOrWhiteSpace(document.ActiveFigureId)) return FigureErrors.NoFiguresMatch("active figure");
-            var active = document.FindFigure(document.ActiveFigureId);
-            return active is null ? FigureErrors.NotFound(document.ActiveFigureId) : new List<DocumentFigure> { active };
+            if (!command.RetainDatabase)
+            {
+                try
+                {
+                    if (Directory.Exists(tempWorkspace))
+                        Directory.Delete(tempWorkspace, recursive: true);
+                }
+                catch { }
+            }
         }
-
-        var trimmed = selector.Trim();
-        if (string.Equals(trimmed, "all", StringComparison.OrdinalIgnoreCase))
-            return document.Figures.Count > 0 ? document.Figures.ToList() : FigureErrors.NoFiguresMatch("all");
-
-        if (trimmed.StartsWith("Fig_", StringComparison.Ordinal))
-        {
-            var byId = document.FindFigure(trimmed);
-            return byId is null ? FigureErrors.NotFound(trimmed) : new List<DocumentFigure> { byId };
-        }
-
-        if (int.TryParse(trimmed, out int idx))
-        {
-            if (idx < 1 || idx > document.Figures.Count)
-                return IndexErrors.OutOfIndexBounds(idx, 1, Math.Max(1, document.Figures.Count));
-            var byIdx = document.FindFigureByIndex(idx);
-            return byIdx is null ? FigureErrors.NotFound($"#{idx}") : new List<DocumentFigure> { byIdx };
-        }
-
-        return FigureErrors.NoFiguresMatch(trimmed);
     }
 }

@@ -38,12 +38,14 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.12" />
   </ItemGroup>
 
-  <ItemGroup>
-    <EmbeddedResource Include="..\..\docs\README.md" LogicalName="Melomg.Cli.Docs.README.md" />
-    <EmbeddedResource Include="..\..\docs\COMMANDS.md" LogicalName="Melomg.Cli.Docs.COMMANDS.md" />
-    <EmbeddedResource Include="..\..\docs\ONNX_AND_DETECTION.md" LogicalName="Melomg.Cli.Docs.ONNX_AND_DETECTION.md" />
-    <EmbeddedResource Include="..\..\docs\AI_AGENT_PLAYBOOK.md" LogicalName="Melomg.Cli.Docs.AI_AGENT_PLAYBOOK.md" />
-    <EmbeddedResource Include="..\..\docs\ARCHITECTURE.md" LogicalName="Melomg.Cli.Docs.ARCHITECTURE.md" />
-  </ItemGroup>
+  <Target Name="RenamePublishedExecutable" AfterTargets="Publish">
+    <PropertyGroup>
+      <_PublishedSourceExe>$([System.IO.Path]::Combine('$(PublishDir)', '$(AssemblyName).exe'))</_PublishedSourceExe>
+      <_PublishedTargetExe>$([System.IO.Path]::Combine('$(PublishDir)', 'meloberry-melomg-$(Version).exe'))</_PublishedTargetExe>
+    </PropertyGroup>
+    <Delete Files="$(_PublishedTargetExe)" Condition="Exists('$(_PublishedTargetExe)')" />
+    <Move SourceFiles="$(_PublishedSourceExe)" DestinationFiles="$(_PublishedTargetExe)" Condition="Exists('$(_PublishedSourceExe)')" />
+    <Message Importance="High" Text="Published executable: $(_PublishedTargetExe)" Condition="Exists('$(_PublishedTargetExe)')" />
+  </Target>
 
 </Project>

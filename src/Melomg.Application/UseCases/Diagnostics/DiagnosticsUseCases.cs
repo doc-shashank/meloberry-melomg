@@ -1,80 +1,43 @@
 using Melomg.Application.Abstractions;
+using Melomg.Application.Addressing;
 using Melomg.Domain.Common;
 using Melomg.Domain.Documents;
-using Melomg.Domain.Errors;
 
 namespace Melomg.Application.UseCases.Diagnostics;
-
-public sealed record GetDeleteImpactQuery(string TargetId);
-
-public sealed record DeleteImpactResponse(string TargetId, string EntityKind, string WarningSummary);
-
-public sealed class GetDeleteImpactHandler(IDocumentWorkspaceRepository repository)
-{
-    public async Task<Result<DeleteImpactResponse>> HandleAsync(GetDeleteImpactQuery query, CancellationToken cancellationToken = default)
-    {
-        if (query.TargetId.StartsWith("Doc_", StringComparison.Ordinal))
-        {
-            var docLookup = await repository.FindDocumentAsync(query.TargetId, cancellationToken);
-            if (docLookup is null) return DocumentErrors.NotFound(query.TargetId);
-
-            var doc = docLookup.Document;
-            string warningSummary = doc.Mode == WorkspaceMode.Project
-                ? $"Deleting project '{doc.Id}' (\"{doc.Title}\", {doc.PageCount} page(s), {doc.Figures.Count} figure(s)) will permanently remove the project directory '{docLookup.StorageDirectory}', including its SQLite database and PDF '{doc.StoredPdfPath}'."
-                : $"Deleting document workspace '{doc.Id}' (\"{doc.Title}\", {doc.PageCount} page(s), {doc.Figures.Count} figure(s)) will permanently remove its SQLite database and workspace outputs at '{docLookup.StorageDirectory}' (the original source PDF is never deleted).";
-            return new DeleteImpactResponse(doc.Id, "document", warningSummary);
-        }
-
-        if (query.TargetId.StartsWith("Fig_", StringComparison.Ordinal))
-        {
-            var owner = await repository.FindFigureOwnerAsync(query.TargetId, cancellationToken);
-            if (owner is null) return FigureErrors.NotFound(query.TargetId);
-
-            var fig = owner.Figure;
-            return new DeleteImpactResponse(
-                fig.Id, "figure",
-                $"Deleting figure '{fig.Id}' (index #{fig.Index}, page {fig.PageNumber}, {fig.Category}) from '{owner.Document.Id}' will shift subsequent figure indices up (n - 1).");
-        }
-
-        return DocumentErrors.NotFound(query.TargetId);
-    }
-}
 
 public enum LintSeverity { Warning, Error }
 
 public sealed record LintIssue(string Code, LintSeverity Severity, string EntityId, string Message);
 
-public sealed record LintDocumentQuery(string TargetId);
+public sealed record LintDocumentQuery(string TargetAddress, bool Quiet = false, bool Verbose = false);
 
-public sealed record LintReportResponse(string TargetId, bool IsClean, int ErrorCount, int WarningCount, IReadOnlyList<LintIssue> Issues);
+public sealed record LintReportResponse(
+    string TargetId,
+    bool IsClean,
+    int ErrorCount,
+    int WarningCount,
+    IReadOnlyList<LintIssue> Issues,
+    IReadOnlyList<int>? SuspectPages = null);
 
 public sealed class LintDocumentHandler(
-    IDocumentWorkspaceRepository repository, IPdfIngestionEngine pdfEngine,
-    IFigureImageExtractor figureExtractor, IWorkingDirectoryProvider workingDirectoryProvider)
+    AddressResolver resolver,
+    IPdfIngestionEngine pdfEngine,
+    IFigureImageExtractor figureExtractor,
+    IWorkingDirectoryProvider workingDirectoryProvider)
 {
     public async Task<Result<LintReportResponse>> HandleAsync(LintDocumentQuery query, CancellationToken cancellationToken = default)
     {
-        PdfDocument document;
-        string storageDir;
-        IReadOnlyList<DocumentFigure> figuresToCheck;
-        bool isFigureTarget = query.TargetId.StartsWith("Fig_", StringComparison.Ordinal);
+        var resolvedRes = await resolver.ResolveTargetAsync(query.TargetAddress, cancellationToken);
+        if (!resolvedRes.IsSuccess) return resolvedRes.Error!;
 
-        if (isFigureTarget)
-        {
-            var owner = await repository.FindFigureOwnerAsync(query.TargetId, cancellationToken);
-            if (owner is null) return FigureErrors.NotFound(query.TargetId);
-            document = owner.Document;
-            storageDir = owner.StorageDirectory;
-            figuresToCheck = [owner.Figure];
-        }
-        else
-        {
-            var lookup = await repository.FindDocumentAsync(query.TargetId, cancellationToken);
-            if (lookup is null) return DocumentErrors.NotFound(query.TargetId);
-            document = lookup.Document;
-            storageDir = lookup.StorageDirectory;
-            figuresToCheck = document.Figures;
-        }
+        var resolved = resolvedRes.Value;
+        var document = resolved.DocumentContext.Document;
+        string storageDir = resolved.DocumentContext.StorageDirectory;
+        IReadOnlyList<DocumentFigure> figuresToCheck = resolved.Figures;
+        bool isDocTarget = resolved.Address.Kind == AddressKind.Document;
+        string reportedId = resolved.Address.Kind == AddressKind.FigureId
+            ? resolved.Figures[0].Id
+            : (isDocTarget ? document.Id : resolved.Address.RawAddress);
 
         var issues = new List<LintIssue>();
         if (!workingDirectoryProvider.DirectoryExists(storageDir) ||
@@ -96,7 +59,7 @@ public sealed class LintDocumentHandler(
                 issues.Add(new LintIssue("Lint.CorruptedSourcePdf", LintSeverity.Error, document.Id, integrity.Error!.Description));
         }
 
-        if (!isFigureTarget && document.Figures.Count == 0)
+        if (isDocTarget && document.Figures.Count == 0)
         {
             issues.Add(new LintIssue("Lint.NoFiguresDetected", LintSeverity.Warning, document.Id,
                 $"Document '{document.Id}' currently has 0 detected or manual figures."));
@@ -124,7 +87,32 @@ public sealed class LintDocumentHandler(
             }
         }
 
+        IReadOnlyList<int>? suspectPages = null;
+        if (isDocTarget)
+        {
+            var anomalyReport = FigureSequenceAnalyzer.Analyze(document);
+            foreach (var anomaly in anomalyReport.Anomalies)
+            {
+                string entityId = anomaly.FigureIds is { Count: 1 } ? anomaly.FigureIds[0] : document.Id;
+                issues.Add(new LintIssue(MapAnomalyLintCode(anomaly.Code), LintSeverity.Warning, entityId, anomaly.Message));
+            }
+            if (anomalyReport.SuspectPages.Count > 0)
+                suspectPages = anomalyReport.SuspectPages;
+        }
+
         int errorCount = issues.Count(i => i.Severity == LintSeverity.Error);
-        return new LintReportResponse(query.TargetId, IsClean: errorCount == 0, errorCount, issues.Count - errorCount, issues);
+        int warningCount = issues.Count - errorCount;
+        var returnedIssues = query.Quiet && errorCount == 0 && warningCount == 0 ? [] : issues;
+        return new LintReportResponse(reportedId, IsClean: errorCount == 0, errorCount, warningCount, returnedIssues, suspectPages);
     }
+
+    private static string MapAnomalyLintCode(string anomalyCode) => anomalyCode switch
+    {
+        "Anomaly.SequenceGap" => "Lint.SequenceGap",
+        "Anomaly.DuplicateNumber" => "Lint.DuplicateFigureNumber",
+        "Anomaly.OutOfOrderNumber" => "Lint.OutOfOrderFigureNumber",
+        "Anomaly.UnnumberedFigure" => "Lint.UnnumberedFigure",
+        "Anomaly.LowConfidence" => "Lint.LowConfidenceFigure",
+        _ => anomalyCode
+    };
 }

@@ -1,118 +1,188 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using Melomg.Application.UseCases.Figures;
 using Melomg.Cli.Abstractions;
+using Melomg.Domain.Common;
+using Melomg.Domain.Documents;
 
 namespace Melomg.Cli.Commands;
 
-public sealed class FiguresCliCommand : CliCommand
+public sealed class PatchCliCommand : CliCommand
 {
-    public FiguresCliCommand()
+    private const string UsageText = "patch <addr> [file|-] [--set k=v]... [--move <idx>:<shift|exchange>]";
+
+    public PatchCliCommand()
         : base(new CommandDescriptor(
-            Verb: "figures",
-            Usage: "[<docID>] figures [--page <n>] [--category <cat>] [--min-confidence <0..1>]",
-            Description: "Lists detected and manual figures in a document with 1-based indices, coordinates, and captions.",
-            AcceptsLeadingTargetId: true,
+            Verb: "patch",
+            Usage: UsageText,
+            Description: "Updates document title or figure bbox, caption, label, number, category, or order.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Figures,
-            Examples: ["melomg Doc_2026... figures", "melomg --doc Doc_2026... figures --page 1 --category chart"]))
+            Examples:
+            [
+                "melomg patch Doc_2026... --set title=\"Cell Biology\"",
+                "melomg patch Doc_2026...#2.1 --set category=diagram --set label=\"Fig. 2.1\"",
+                "melomg patch Doc_2026...#f2 --move 1:shift"
+            ]))
     {
     }
 
-    public sealed class Handler(ListFiguresHandler useCase) : ICommandHandler
+    public sealed class Handler(PatchTargetHandler useCase) : ICommandHandler
     {
         public async Task<int> InvokeAsync(CliInvocationContext context)
         {
-            if (!CliCommandHelpers.TryResolveDocumentId(context, allowPositional: true, "[<docID>] figures", out var docId, out int err))
-                return err;
+            if (context.PositionalArgs.Count < 1 || context.PositionalArgs.Count > 2)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
 
-            if (!CliCommandHelpers.TryGetIntOption(context, "page", out var pageNum, out int pageErr))
-                return pageErr;
-            if (!CliCommandHelpers.TryGetDoubleOption(context, "min-confidence", out var minConf, out int confErr))
-                return confErr;
+            string address = context.PositionalArgs[0];
+            string? title = null;
+            BoundingBox? bbox = null;
+            string? caption = null;
+            string? label = null;
+            string? num = null;
+            string? category = null;
+            int? moveIndex = null;
+            ReorderMode? moveMode = null;
 
-            context.NamedOptions.TryGetValue("category", out var category);
-            var res = await useCase.HandleAsync(new ListFiguresQuery(docId, pageNum, category, minConf), context.CancellationToken);
+            if (context.PositionalArgs.Count == 2)
+            {
+                var readRes = await CliCommandHelpers.ReadFileOrStdinAsync(context.PositionalArgs[1], context.Console, context.CancellationToken);
+                if (!readRes.IsSuccess) return readRes.ToExitCode(context.Console, context.GlobalOptions.Json);
+
+                if (!TryParsePatchJson(readRes.Value, out var jsonInput, out var jsonErr))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", jsonErr!, context.GlobalOptions.Json);
+
+                title = jsonInput!.Title;
+                caption = jsonInput.Caption;
+                label = jsonInput.Label;
+                num = jsonInput.Num;
+                category = jsonInput.Category;
+
+                if (jsonInput.Bbox is not null)
+                {
+                    if (jsonInput.Bbox.Length != 4)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", "'bbox' must be a 4-element array [x, y, width, height].", context.GlobalOptions.Json, path: "bbox");
+                    bbox = new BoundingBox(jsonInput.Bbox[0], jsonInput.Bbox[1], jsonInput.Bbox[2], jsonInput.Bbox[3]);
+                }
+
+                if (!string.IsNullOrWhiteSpace(jsonInput.Move))
+                {
+                    if (!CliCommandHelpers.TryParseMoveSpec(jsonInput.Move, out int mIdx, out var mMode))
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidMode", $"Invalid move spec '{jsonInput.Move}'. Use <index>:<shift|exchange>.", context.GlobalOptions.Json, path: "move");
+                    moveIndex = mIdx;
+                    moveMode = mMode;
+                }
+            }
+
+            if (context.MultiValueOptions.TryGetValue("set", out var setPairs))
+            {
+                foreach (var pair in setPairs)
+                {
+                    int eq = pair.IndexOf('=');
+                    if (eq <= 0)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Invalid --set '{pair}'. Expected key=value.", context.GlobalOptions.Json);
+
+                    string key = pair[..eq].Trim().ToLowerInvariant();
+                    string val = pair[(eq + 1)..];
+                    switch (key)
+                    {
+                        case "title": title = val; break;
+                        case "caption": caption = val; break;
+                        case "label": label = val; break;
+                        case "num": case "number": num = val; break;
+                        case "category": category = val; break;
+                        case "bbox":
+                            if (!TryParseBboxString(val, out var parsedBbox))
+                                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidNumber", $"Invalid bbox '{val}'. Expected x,y,w,h.", context.GlobalOptions.Json);
+                            bbox = parsedBbox;
+                            break;
+                        default:
+                            return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Unknown patch key '{key}'. Allowed: title, bbox, caption, label, num, category.", context.GlobalOptions.Json);
+                    }
+                }
+            }
+
+            if (context.NamedOptions.TryGetValue("move", out var moveRaw) && !string.IsNullOrWhiteSpace(moveRaw))
+            {
+                if (!CliCommandHelpers.TryParseMoveSpec(moveRaw, out int mIdx, out var mMode))
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidMode", $"Invalid --move '{moveRaw}'. Use <index>:<shift|exchange>.", context.GlobalOptions.Json);
+                moveIndex = mIdx;
+                moveMode = mMode;
+            }
+
+            var res = await useCase.HandleAsync(
+                new PatchTargetCommand(address, title, bbox, caption, label, num, category, moveIndex, moveMode),
+                context.CancellationToken);
 
             return CliCommandHelpers.Finish(context, res, v =>
-            {
-                if (v.Figures.Count == 0)
-                    return $"Document {v.DocumentId} has 0 matching figures.";
-
-                var sb = new StringBuilder();
-                sb.AppendLine($"Figures in {v.DocumentId} (\"{v.Title}\"): {v.Figures.Count} shown / {v.TotalFigures} total");
-                foreach (var f in v.Figures)
-                {
-                    var cap = string.IsNullOrWhiteSpace(f.Caption) ? "" : $"  \"{f.Caption}\"";
-                    sb.AppendLine($"  [{f.Index}] {f.FigureId}  p{f.PageNumber}  {f.Category,-8}  conf={f.Confidence:F2}  src={f.Source,-11}  bbox=({f.BoundingBox.X:F1}, {f.BoundingBox.Y:F1}, {f.BoundingBox.Width:F1}, {f.BoundingBox.Height:F1}){cap}");
-                }
-                return sb.ToString().TrimEnd();
-            });
+                v.EntityKind == "document"
+                    ? $"Patched document {v.DocumentId} title=\"{v.Title}\"."
+                    : $"Patched figure {v.TargetId} (#f{v.Index}, num={v.FigureNumber ?? "-"}, {v.Category}).");
         }
-    }
-}
 
-public sealed class InspectCliCommand : CliCommand
-{
-    public InspectCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "inspect",
-            Usage: "[<figID>] inspect",
-            Description: "Displays detailed coordinates, normalized box, pixel size, caption, and extraction state for a figure.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            Examples: ["melomg Fig_2026... inspect", "melomg --figure Fig_2026... inspect --json"]))
-    {
-    }
-
-    public sealed class Handler(InspectFigureHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
+        internal static bool TryParseBboxString(string raw, out BoundingBox? bbox)
         {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: true, "[<figID>] inspect", out var figId, out int err))
-                return err;
+            bbox = null;
+            var parts = raw.Split(',', StringSplitOptions.TrimEntries);
+            if (parts.Length != 4) return false;
+            Span<double> vals = stackalloc double[4];
+            for (int i = 0; i < 4; i++)
+                if (!double.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out vals[i]))
+                    return false;
+            bbox = new BoundingBox(vals[0], vals[1], vals[2], vals[3]);
+            return true;
+        }
 
-            var res = await useCase.HandleAsync(new InspectFigureQuery(figId), context.CancellationToken);
-            return CliCommandHelpers.Finish(context, res, f =>
+        private static bool TryParsePatchJson(string json, out PatchJsonInput? input, out string? error)
+        {
+            input = null;
+            error = null;
+            try
             {
-                var sb = new StringBuilder();
-                sb.AppendLine($"Figure:      {f.FigureId} (#{f.Index} in {f.DocumentId})");
-                sb.AppendLine($"Page:        {f.PageNumber} (page-local #{f.PageFigureIndex}, {f.PageWidthPts:F1}x{f.PageHeightPts:F1} pts)");
-                sb.AppendLine($"Category:    {f.Category}  (source: {f.Source}, confidence: {f.Confidence:F2})");
-                sb.AppendLine($"Label:       {f.Label}");
-                sb.AppendLine($"Caption:     {f.Caption ?? "(none)"}");
-                sb.AppendLine($"BBox (pts):  x={f.BoundingBoxPts.X:F2}, y={f.BoundingBoxPts.Y:F2}, w={f.BoundingBoxPts.Width:F2}, h={f.BoundingBoxPts.Height:F2}");
-                if (f.CaptionBoundingBoxPts is { } cb)
-                    sb.AppendLine($"CaptionBBox: x={cb.X:F2}, y={cb.Y:F2}, w={cb.Width:F2}, h={cb.Height:F2}");
-                sb.AppendLine($"Normalized:  x={f.NormalizedBox.X:F4}, y={f.NormalizedBox.Y:F4}, w={f.NormalizedBox.Width:F4}, h={f.NormalizedBox.Height:F4}");
-                sb.AppendLine($"Pixels@150:  {f.DefaultPixelRectAt150Dpi.PixelWidth}x{f.DefaultPixelRectAt150Dpi.PixelHeight} px");
-                sb.AppendLine($"Saved Masks: {f.LabelMasks.Count}");
-                foreach (var m in f.LabelMasks)
-                    sb.AppendLine($"               [{m.Index}] ({m.BoundingBoxPts.X:F1}, {m.BoundingBoxPts.Y:F1}, {m.BoundingBoxPts.Width:F1}, {m.BoundingBoxPts.Height:F1}) style={m.Style} {(m.LabelText is null ? "" : $"\"{m.LabelText}\"")}".TrimEnd());
-                sb.AppendLine($"Text Labels: {f.DetectedLabels.Count}");
-                foreach (var l in f.DetectedLabels.Take(20))
-                    sb.AppendLine($"               [{l.Index}] \"{l.Text}\" @ ({l.BoundingBoxPts.X:F1}, {l.BoundingBoxPts.Y:F1}, {l.BoundingBoxPts.Width:F1}, {l.BoundingBoxPts.Height:F1})");
-                if (f.DetectedLabels.Count > 20)
-                    sb.AppendLine($"               ... (+{f.DetectedLabels.Count - 20} more; run '--json' for full list)");
-                sb.AppendLine($"Extracted:   {f.LastExtractedPath ?? "(not yet extracted)"}");
-                return sb.ToString().TrimEnd();
-            }, f => { context.SessionContext.ActiveDocumentId = f.DocumentId; context.SessionContext.ActiveFigureId = f.FigureId; });
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    error = "Patch JSON must be an object.";
+                    return false;
+                }
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                {
+                    if (prop.Name is not ("title" or "bbox" or "caption" or "label" or "num" or "category" or "move"))
+                    {
+                        error = $"Unrecognized patch property '{prop.Name}'.";
+                        return false;
+                    }
+                }
+                input = JsonSerializer.Deserialize(json, MelomgCliJsonContext.Default.PatchJsonInput);
+                if (input is null) { error = "Patch JSON was empty."; return false; }
+                return true;
+            }
+            catch (JsonException ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
     }
 }
 
-public sealed class AddFigureCliCommand : CliCommand
+public sealed class AddCliCommand : CliCommand
 {
-    public AddFigureCliCommand()
+    private const string UsageText = "add <docId> <page> <x> <y> <w> <h> [--category <figure|diagram|chart>] [--num <num>] [--caption <text>] [--label <text>] [--index <n>]  OR  add <docId> <file|->";
+
+    public AddCliCommand()
         : base(new CommandDescriptor(
-            Verb: "addfigure",
-            Usage: "[<docID>] addfigure <page> <x> <y> <width> <height> [--category <cat>] [--caption <text>] [--label <text>] [index]",
-            Description: "Manually registers a figure bounding box on a PDF page and inserts it at [index] or appends.",
-            AcceptsLeadingTargetId: true,
+            Verb: "add",
+            Usage: UsageText,
+            Description: "Manually registers an image, diagram, or chart bounding box on a PDF page.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Figures,
-            Examples: ["melomg Doc_2026... addfigure 1 72 120 420 260 --category diagram --caption \"Figure 1: System\""]))
+            Examples:
+            [
+                "melomg add Doc_2026... 1 72 120 420 260 --category diagram --num 2.5 --caption \"Fig. 2.5: Pipeline\"",
+                "melomg add Doc_2026... -"
+            ]))
     {
     }
 
@@ -120,25 +190,74 @@ public sealed class AddFigureCliCommand : CliCommand
     {
         public async Task<int> InvokeAsync(CliInvocationContext context)
         {
-            if (!CliCommandHelpers.TryResolveDocumentId(context, allowPositional: false, "[<docID>] addfigure <page> <x> <y> <width> <height> [index]", out var docId, out int err))
-                return err;
+            var pos = context.PositionalArgs;
+            if (pos.Count < 2)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
 
-            if (context.PositionalArgs.Count < 5 || context.PositionalArgs.Count > 6)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<docID>] addfigure <page> <x> <y> <width> <height> [index]", context.GlobalOptions.Json);
+            string docId = pos[0];
+            if (pos.Count == 2)
+            {
+                var readRes = await CliCommandHelpers.ReadFileOrStdinAsync(pos[1], context.Console, context.CancellationToken);
+                if (!readRes.IsSuccess) return readRes.ToExitCode(context.Console, context.GlobalOptions.Json);
+
+                AddFigureJsonInput? jsonInput;
+                try
+                {
+                    using var doc = JsonDocument.Parse(readRes.Value);
+                    if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", "Add JSON must be an object.", context.GlobalOptions.Json);
+                    foreach (var prop in doc.RootElement.EnumerateObject())
+                    {
+                        if (prop.Name is not ("page" or "x" or "y" or "width" or "height" or "bbox" or "category" or "caption" or "label" or "num" or "index"))
+                            return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", $"Unrecognized property '{prop.Name}'.", context.GlobalOptions.Json, path: prop.Name);
+                    }
+                    jsonInput = JsonSerializer.Deserialize(readRes.Value, MelomgCliJsonContext.Default.AddFigureJsonInput);
+                }
+                catch (JsonException ex)
+                {
+                    return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", ex.Message, context.GlobalOptions.Json);
+                }
+
+                if (jsonInput?.Page is null)
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "'page' is required in add JSON.", context.GlobalOptions.Json, path: "page");
+
+                double x, y, w, h;
+                if (jsonInput.Bbox is { Length: 4 })
+                {
+                    x = jsonInput.Bbox[0]; y = jsonInput.Bbox[1]; w = jsonInput.Bbox[2]; h = jsonInput.Bbox[3];
+                }
+                else if (jsonInput.X.HasValue && jsonInput.Y.HasValue && jsonInput.Width.HasValue && jsonInput.Height.HasValue)
+                {
+                    x = jsonInput.X.Value; y = jsonInput.Y.Value; w = jsonInput.Width.Value; h = jsonInput.Height.Value;
+                }
+                else
+                {
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Provide 'bbox': [x,y,w,h] or 'x','y','width','height'.", context.GlobalOptions.Json);
+                }
+
+                var jsonRes = await useCase.HandleAsync(
+                    new AddManualFigureCommand(docId, jsonInput.Page.Value, x, y, w, h, jsonInput.Category, jsonInput.Caption, jsonInput.Label, jsonInput.Num, jsonInput.Index),
+                    context.CancellationToken);
+
+                return CliCommandHelpers.Finish(context, jsonRes, v => $"Added {v.FigureId} (#f{v.Index}, p{v.PageNumber}, {v.Category}).");
+            }
+
+            if (pos.Count < 6 || pos.Count > 7)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
 
             Span<double> coords = stackalloc double[4];
-            if (!int.TryParse(context.PositionalArgs[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int pageNum) ||
-                !CliCommandHelpers.TryParseDoubles(context.PositionalArgs, 1, coords))
+            if (!int.TryParse(pos[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int pageNum) ||
+                !CliCommandHelpers.TryParseDoubles(pos, 2, coords))
             {
                 return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidNumber", "Page and bounding box coordinates (x, y, width, height) must be numeric.", context.GlobalOptions.Json);
             }
 
-            if (!CliCommandHelpers.TryParseOptionalPositiveIndex(
-                    context.PositionalArgs.Count == 6 ? context.PositionalArgs[5] : null,
-                    out var index,
-                    out int idxErr,
-                    context.Console,
-                    context.GlobalOptions.Json))
+            if (!CliCommandHelpers.TryGetIntOption(context, "index", out var optIdx, out int idxOptErr))
+                return idxOptErr;
+
+            int? index = optIdx;
+            if (!index.HasValue && pos.Count == 7 &&
+                !CliCommandHelpers.TryParseOptionalPositiveIndex(pos[6], out index, out int idxErr, context.Console, context.GlobalOptions.Json))
             {
                 return idxErr;
             }
@@ -146,186 +265,35 @@ public sealed class AddFigureCliCommand : CliCommand
             context.NamedOptions.TryGetValue("category", out var category);
             context.NamedOptions.TryGetValue("caption", out var caption);
             context.NamedOptions.TryGetValue("label", out var label);
+            context.NamedOptions.TryGetValue("num", out var num);
 
             var res = await useCase.HandleAsync(
-                new AddManualFigureCommand(docId, pageNum, coords[0], coords[1], coords[2], coords[3], category, caption, label, index),
+                new AddManualFigureCommand(docId, pageNum, coords[0], coords[1], coords[2], coords[3], category, caption, label, num, index),
                 context.CancellationToken);
 
-            return CliCommandHelpers.Finish(
-                context,
-                res,
-                v => $"Added manual figure {v.FigureId} at index {v.Index} on page {v.PageNumber} ({v.Category}).",
-                v => { context.SessionContext.ActiveDocumentId = v.DocumentId; context.SessionContext.ActiveFigureId = v.FigureId; });
-        }
-    }
-}
-
-public sealed class SetBboxCliCommand : CliCommand
-{
-    public SetBboxCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "setbbox",
-            Usage: "[<figID>] setbbox <x> <y> <width> <height>",
-            Description: "Updates the bounding box (in PDF points) of a figure within its page dimensions.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            Examples: ["melomg Fig_2026... setbbox 60 110 440 280"]))
-    {
-    }
-
-    public sealed class Handler(SetFigureBoundingBoxHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
-        {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] setbbox <x> <y> <width> <height>", out var figId, out int err))
-                return err;
-
-            Span<double> coords = stackalloc double[4];
-            if (context.PositionalArgs.Count != 4 || !CliCommandHelpers.TryParseDoubles(context.PositionalArgs, 0, coords))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] setbbox <x> <y> <width> <height>", context.GlobalOptions.Json);
-
-            var res = await useCase.HandleAsync(new SetFigureBoundingBoxCommand(figId, coords[0], coords[1], coords[2], coords[3]), context.CancellationToken);
-            return CliCommandHelpers.Finish(context, res, v => $"Updated bounding box of {v.FigureId} on page {v.PageNumber} to ({v.BoundingBox.X:F2}, {v.BoundingBox.Y:F2}, {v.BoundingBox.Width:F2}, {v.BoundingBox.Height:F2}).");
-        }
-    }
-}
-
-public sealed class SetCaptionCliCommand : CliCommand
-{
-    public SetCaptionCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "setcaption",
-            Usage: "[<figID>] setcaption <text>",
-            Description: "Sets or updates the caption associated with a figure.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            Examples: ["melomg Fig_2026... setcaption \"Figure 1: Transformer Architecture\""]))
-    {
-    }
-
-    public sealed class Handler(SetFigureCaptionHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
-        {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] setcaption <text>", out var figId, out int err))
-                return err;
-            if (context.PositionalArgs.Count != 1)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] setcaption <text>", context.GlobalOptions.Json);
-            return CliCommandHelpers.Finish(context, await useCase.HandleAsync(new SetFigureCaptionCommand(figId, context.PositionalArgs[0]), context.CancellationToken), v => $"Updated caption for {v.FigureId}.");
-        }
-    }
-}
-
-public sealed class SetLabelCliCommand : CliCommand
-{
-    public SetLabelCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "setlabel",
-            Usage: "[<figID>] setlabel <label>",
-            Description: "Sets or updates the short label (e.g., 'Figure 2.1') on a figure.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            Examples: ["melomg Fig_2026... setlabel \"Figure 2.1\""]))
-    {
-    }
-
-    public sealed class Handler(SetFigureLabelHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
-        {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] setlabel <label>", out var figId, out int err))
-                return err;
-            if (context.PositionalArgs.Count != 1)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] setlabel <label>", context.GlobalOptions.Json);
-            return CliCommandHelpers.Finish(context, await useCase.HandleAsync(new SetFigureLabelCommand(figId, context.PositionalArgs[0]), context.CancellationToken), v => $"Updated label of {v.FigureId} to \"{v.Label}\".");
-        }
-    }
-}
-
-public sealed class SetCategoryCliCommand : CliCommand
-{
-    public SetCategoryCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "setcategory",
-            Usage: "[<figID>] setcategory <figure|chart|diagram|table|formula>",
-            Description: "Sets the classification category of a figure.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            Examples: ["melomg Fig_2026... setcategory chart"]))
-    {
-    }
-
-    public sealed class Handler(SetFigureCategoryHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
-        {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] setcategory <figure|chart|diagram|table|formula>", out var figId, out int err))
-                return err;
-            if (context.PositionalArgs.Count != 1)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] setcategory <figure|chart|diagram|table|formula>", context.GlobalOptions.Json);
-            return CliCommandHelpers.Finish(context, await useCase.HandleAsync(new SetFigureCategoryCommand(figId, context.PositionalArgs[0]), context.CancellationToken), v => $"Updated category of {v.FigureId} to '{v.Category}'.");
-        }
-    }
-}
-
-public sealed class SetIndexCliCommand : CliCommand
-{
-    public SetIndexCliCommand()
-        : base(new CommandDescriptor(
-            Verb: "setindex",
-            Usage: "[<figID>] setindex <number> <exchange|shift>",
-            Description: "Reorders a figure using 1-based indexing in exchange or shift mode.",
-            AcceptsLeadingTargetId: true,
-            HandlerType: typeof(Handler),
-            Category: CommandCategory.Figures,
-            DetailedNotes: "'exchange' swaps positions with the occupant at <number>. 'shift' shifts intermediate items up (n - 1) or down (n + 1). Rejects out-of-range indices with Index.OutOfIndexBounds.",
-            Examples: ["melomg Fig_2026... setindex 1 shift", "melomg Fig_2026... setindex 3 exchange"]))
-    {
-    }
-
-    public sealed class Handler(ReorderFigureHandler useCase) : ICommandHandler
-    {
-        public async Task<int> InvokeAsync(CliInvocationContext context)
-        {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] setindex <number> <exchange|shift>", out var figId, out int err))
-                return err;
-
-            if (context.PositionalArgs.Count != 2)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] setindex <number> <exchange|shift>", context.GlobalOptions.Json);
-
-            if (!int.TryParse(context.PositionalArgs[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int targetIndex))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidIndex", $"Target index '{context.PositionalArgs[0]}' must be an integer.", context.GlobalOptions.Json);
-
-            if (!CliCommandHelpers.TryParseReorderMode(context.PositionalArgs[1], out var mode))
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidMode", "Mode must be 'exchange' or 'shift'.", context.GlobalOptions.Json);
-
-            return CliCommandHelpers.Finish(context, await useCase.HandleAsync(new ReorderFigureCommand(figId, targetIndex, mode), context.CancellationToken), v => $"Moved figure {v.FigureId} to index {v.NewIndex} ({v.Mode}).");
+            return CliCommandHelpers.Finish(context, res, v => $"Added {v.FigureId} (#f{v.Index}, p{v.PageNumber}, {v.Category}).");
         }
     }
 }
 
 public sealed class MaskCliCommand : CliCommand
 {
+    private const string UsageText = "mask <figAddr> <ls|add|auto|rm|clear> [args...]";
+
     public MaskCliCommand()
         : base(new CommandDescriptor(
             Verb: "mask",
-            Usage: "[<figID>] mask <list|add|auto|remove|clear> [args...]",
+            Usage: UsageText,
             Description: "Lists, adds, auto-detects, removes, or clears label obfuscation masks on a figure.",
-            AcceptsLeadingTargetId: true,
             HandlerType: typeof(Handler),
             Category: CommandCategory.Figures,
-            DetailedNotes: "Subcommands:\n  mask list\n  mask add <x> <y> <w> <h> [--label \"<text>\"] [--style <solid|blur|pixelate|whiteout>] [--color <#RRGGBB>]\n  mask auto [--match \"<term1,term2>\"] [--style <solid|blur|pixelate|whiteout>] [--color <#RRGGBB>]\n  mask remove <maskIndex>\n  mask clear",
             Examples:
             [
-                "melomg Fig_2026... mask list",
-                "melomg Fig_2026... mask auto --match \"Neutrophil,Macrophage\" --style solid",
-                "melomg Fig_2026... mask add 120 240 85 18 --label \"Manual Region\" --style blur",
-                "melomg Fig_2026... mask remove 1",
-                "melomg Fig_2026... mask clear"
+                "melomg mask Doc_2026...#2.1 ls",
+                "melomg mask Doc_2026...#2.1 auto --match \"Neutrophil,Macrophage\" --style solid",
+                "melomg mask Fig_2026... add 120 240 85 18 --label \"Label\" --style blur",
+                "melomg mask Doc_2026...#2.1 rm 1",
+                "melomg mask Doc_2026...#2.1 clear"
             ]))
     {
     }
@@ -339,34 +307,32 @@ public sealed class MaskCliCommand : CliCommand
     {
         public async Task<int> InvokeAsync(CliInvocationContext context)
         {
-            if (!CliCommandHelpers.TryResolveFigureId(context, allowPositional: false, "[<figID>] mask <list|add|auto|remove|clear> ...", out var figId, out int err))
-                return err;
-
             var pos = context.PositionalArgs;
-            if (pos.Count == 0)
-                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask <list|add|auto|remove|clear> ...", context.GlobalOptions.Json);
+            if (pos.Count < 2)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
 
-            string sub = pos[0].ToLowerInvariant();
+            string figAddr = pos[0];
+            string sub = pos[1].ToLowerInvariant();
             switch (sub)
             {
-                case "list":
-                    if (pos.Count != 1)
-                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask list", context.GlobalOptions.Json);
-                    return CliCommandHelpers.Finish(context, await listHandler.HandleAsync(new ListFigureMasksQuery(figId), context.CancellationToken), v =>
+                case "ls" or "list":
+                    if (pos.Count != 2)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: mask <figAddr> ls", context.GlobalOptions.Json);
+                    return CliCommandHelpers.Finish(context, await listHandler.HandleAsync(new ListFigureMasksQuery(figAddr), context.CancellationToken), v =>
                     {
                         var sb = new StringBuilder();
                         sb.AppendLine($"Masks on {v.FigureId} (p{v.PageNumber}): {v.SavedMasks.Count} saved, {v.DetectedLabels.Count} detected label(s)");
                         foreach (var m in v.SavedMasks)
-                            sb.AppendLine($"  [M{m.Index}] ({m.BoundingBoxPts.X:F1}, {m.BoundingBoxPts.Y:F1}, {m.BoundingBoxPts.Width:F1}, {m.BoundingBoxPts.Height:F1}) style={m.Style} {(m.LabelText is null ? "" : $"\"{m.LabelText}\"")}".TrimEnd());
+                            sb.AppendLine($"  [M{m.Index}] ({m.BoundingBoxPts.X:F1},{m.BoundingBoxPts.Y:F1},{m.BoundingBoxPts.Width:F1},{m.BoundingBoxPts.Height:F1}) {m.Style} {m.LabelText}".TrimEnd());
                         foreach (var l in v.DetectedLabels)
-                            sb.AppendLine($"  [L{l.Index}] \"{l.Text}\" @ ({l.BoundingBoxPts.X:F1}, {l.BoundingBoxPts.Y:F1}, {l.BoundingBoxPts.Width:F1}, {l.BoundingBoxPts.Height:F1})");
+                            sb.AppendLine($"  [L{l.Index}] \"{l.Text}\" @ ({l.BoundingBoxPts.X:F1},{l.BoundingBoxPts.Y:F1},{l.BoundingBoxPts.Width:F1},{l.BoundingBoxPts.Height:F1})");
                         return sb.ToString().TrimEnd();
                     });
                 case "add":
                 {
                     Span<double> coords = stackalloc double[4];
-                    if (pos.Count != 5 || !CliCommandHelpers.TryParseDoubles(pos, 1, coords))
-                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask add <x> <y> <w> <h> [--label \"<text>\"] [--style <solid|blur|pixelate|whiteout>] [--color <#RRGGBB>]", context.GlobalOptions.Json);
+                    if (pos.Count != 6 || !CliCommandHelpers.TryParseDoubles(pos, 2, coords))
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: mask <figAddr> add <x> <y> <w> <h> [--label text] [--style solid|blur|pixelate|whiteout] [--color #RRGGBB]", context.GlobalOptions.Json);
 
                     context.NamedOptions.TryGetValue("label", out var labelText);
                     context.NamedOptions.TryGetValue("style", out var style);
@@ -374,35 +340,35 @@ public sealed class MaskCliCommand : CliCommand
 
                     return CliCommandHelpers.Finish(
                         context,
-                        await addHandler.HandleAsync(new AddFigureMaskCommand(figId, coords[0], coords[1], coords[2], coords[3], labelText, style, color), context.CancellationToken),
-                        v => $"Added mask #{v.AddedMask.Index} ({v.AddedMask.Style}) to {v.FigureId} at ({v.AddedMask.BoundingBoxPts.X:F1}, {v.AddedMask.BoundingBoxPts.Y:F1}, {v.AddedMask.BoundingBoxPts.Width:F1}, {v.AddedMask.BoundingBoxPts.Height:F1}).");
+                        await addHandler.HandleAsync(new AddFigureMaskCommand(figAddr, coords[0], coords[1], coords[2], coords[3], labelText, style, color), context.CancellationToken),
+                        v => $"Added mask #{v.AddedMask.Index} ({v.AddedMask.Style}) to {v.FigureId}.");
                 }
                 case "auto":
-                    if (pos.Count != 1)
-                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask auto [--match \"<term1,term2>\"] [--style <solid|blur|pixelate|whiteout>] [--color <#RRGGBB>]", context.GlobalOptions.Json);
+                    if (pos.Count != 2)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: mask <figAddr> auto [--match p1,p2] [--style ...] [--color ...]", context.GlobalOptions.Json);
                     context.NamedOptions.TryGetValue("match", out var match);
                     context.NamedOptions.TryGetValue("style", out var autoStyle);
                     context.NamedOptions.TryGetValue("color", out var autoColor);
                     return CliCommandHelpers.Finish(
                         context,
-                        await autoHandler.HandleAsync(new AutoMaskFigureLabelsCommand(figId, match, autoStyle, autoColor), context.CancellationToken),
-                        v => $"Auto-masked {v.AddedCount} label(s) on {v.FigureId} (total saved masks: {v.TotalMasks}).");
-                case "remove":
-                    if (pos.Count != 2 || !int.TryParse(pos[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int maskIndex))
-                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask remove <maskIndex>", context.GlobalOptions.Json);
+                        await autoHandler.HandleAsync(new AutoMaskFigureLabelsCommand(figAddr, match, autoStyle, autoColor), context.CancellationToken),
+                        v => $"Auto-masked {v.AddedCount} label(s) on {v.FigureId} (total: {v.TotalMasks}).");
+                case "rm" or "remove":
+                    if (pos.Count != 3 || !int.TryParse(pos[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int maskIndex))
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: mask <figAddr> rm <maskIndex>", context.GlobalOptions.Json);
                     return CliCommandHelpers.Finish(
                         context,
-                        await removeHandler.HandleAsync(new RemoveFigureMaskCommand(figId, maskIndex), context.CancellationToken),
+                        await removeHandler.HandleAsync(new RemoveFigureMaskCommand(figAddr, maskIndex), context.CancellationToken),
                         v => $"Removed mask #{v.RemovedMaskIndex} from {v.FigureId} (remaining: {v.RemainingMasks}).");
                 case "clear":
-                    if (pos.Count != 1)
-                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: [<figID>] mask clear", context.GlobalOptions.Json);
+                    if (pos.Count != 2)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Usage: mask <figAddr> clear", context.GlobalOptions.Json);
                     return CliCommandHelpers.Finish(
                         context,
-                        await clearHandler.HandleAsync(new ClearFigureMasksCommand(figId), context.CancellationToken),
+                        await clearHandler.HandleAsync(new ClearFigureMasksCommand(figAddr), context.CancellationToken),
                         v => $"Cleared {v.ClearedCount} mask(s) from {v.FigureId}.");
                 default:
-                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Unknown mask subcommand '{sub}'. Use list, add, auto, remove, or clear.", context.GlobalOptions.Json);
+                    return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Unknown mask subcommand '{sub}'. Use ls, add, auto, rm, or clear.", context.GlobalOptions.Json);
             }
         }
     }

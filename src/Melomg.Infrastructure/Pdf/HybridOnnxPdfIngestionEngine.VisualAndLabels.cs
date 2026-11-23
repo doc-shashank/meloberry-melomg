@@ -523,6 +523,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine
         float[] tensor,
         int plane,
         RenderedRgbBitmap bitmap,
+        IReadOnlyList<ParsedTextSpan> textSpans,
         double pageW,
         double pageH)
     {
@@ -665,12 +666,64 @@ public sealed partial class HybridOnnxPdfIngestionEngine
 
                 if (count >= 10 && bw >= 65 && bh >= 45 && !(bw > pageW * 0.94 && bh > pageH * 0.94))
                 {
-                    regions.Add(new BoundingBox(Math.Round(bx, 2), Math.Round(by, 2), Math.Round(bw, 2), Math.Round(bh, 2)));
+                    var candidate = new BoundingBox(Math.Round(bx, 2), Math.Round(by, 2), Math.Round(bw, 2), Math.Round(bh, 2));
+                    if (!IsUniformShadedProseBox(candidate, bitmap, textSpans, pageW, pageH))
+                        regions.Add(candidate);
                 }
             }
         }
 
         return regions;
+    }
+
+    private static bool IsUniformShadedProseBox(
+        BoundingBox box,
+        RenderedRgbBitmap bitmap,
+        IReadOnlyList<ParsedTextSpan> textSpans,
+        double pageW,
+        double pageH)
+    {
+        if (!IsProseCalloutBox(box, textSpans))
+            return false;
+
+        double scaleX = bitmap.Width / Math.Max(1.0, pageW);
+        double scaleY = bitmap.Height / Math.Max(1.0, pageH);
+        int x0 = Math.Clamp((int)Math.Floor((box.X + 4) * scaleX), 0, Math.Max(0, bitmap.Width - 1));
+        int x1 = Math.Clamp((int)Math.Ceiling((box.Right - 4) * scaleX), x0, Math.Max(0, bitmap.Width - 1));
+        int y0 = Math.Clamp((int)Math.Floor((box.Y + 4) * scaleY), 0, Math.Max(0, bitmap.Height - 1));
+        int y1 = Math.Clamp((int)Math.Ceiling((box.Bottom - 4) * scaleY), y0, Math.Max(0, bitmap.Height - 1));
+
+        int bgCount = 0;
+        long sumR = 0, sumG = 0, sumB = 0;
+        long sumSqR = 0, sumSqG = 0, sumSqB = 0;
+        int step = Math.Max(1, Math.Min(x1 - x0, y1 - y0) / 24);
+
+        for (int py = y0; py <= y1; py += step)
+        {
+            int rowBase = py * bitmap.Width;
+            for (int px = x0; px <= x1; px += step)
+            {
+                int idx = (rowBase + px) * 3;
+                byte r = bitmap.RgbPixels[idx];
+                byte g = bitmap.RgbPixels[idx + 1];
+                byte b = bitmap.RgbPixels[idx + 2];
+                int lum = (r * 77 + g * 150 + b * 29) >> 8;
+                if (lum < 160) continue; // ignore foreground text ink
+
+                bgCount++;
+                sumR += r; sumG += g; sumB += b;
+                sumSqR += (long)r * r; sumSqG += (long)g * g; sumSqB += (long)b * b;
+            }
+        }
+
+        if (bgCount < 16)
+            return false;
+
+        double varR = (sumSqR / (double)bgCount) - Math.Pow(sumR / (double)bgCount, 2);
+        double varG = (sumSqG / (double)bgCount) - Math.Pow(sumG / (double)bgCount, 2);
+        double varB = (sumSqB / (double)bgCount) - Math.Pow(sumB / (double)bgCount, 2);
+        double maxStd = Math.Sqrt(Math.Max(0, Math.Max(varR, Math.Max(varG, varB))));
+        return maxStd <= 12.0;
     }
 
     internal static BoundingBox TrimRunningHeaderAndFooter(
@@ -848,128 +901,335 @@ public sealed partial class HybridOnnxPdfIngestionEngine
         return ClampToPage(new BoundingBox(figBox.X, top, figBox.Width, Math.Max(4, bottom - top)), pageW, pageH);
     }
 
+    internal sealed record PageCaptionAnchor(
+        string Text,
+        BoundingBox Box,
+        ParsedFigureCaption Parsed);
+
+    internal static List<PageCaptionAnchor> ExtractPageCaptionAnchors(
+        IReadOnlyList<ParsedTextSpan> textSpans,
+        double pageW,
+        double pageH)
+    {
+        var anchors = new List<PageCaptionAnchor>();
+
+        for (int i = 0; i < textSpans.Count; i++)
+        {
+            var lead = textSpans[i];
+            if (!FigureNumberNormalizer.TryParseFigureCaption(lead.Text, out var initialParsed))
+                continue;
+
+            // Reject wrapped inline prose references whose immediately preceding line is an unfinished prose line in the same column
+            bool bareNumberLine = string.Equals(lead.Text.Trim(), initialParsed.ShortLabel, StringComparison.OrdinalIgnoreCase);
+            if (bareNumberLine && HasUnfinishedPrecedingProseLine(lead, textSpans))
+                continue;
+
+            var lines = new List<ParsedTextSpan> { lead };
+            var sb = new StringBuilder(lead.Text.Trim());
+
+            bool inLeftColumn = lead.Right < pageW * 0.52;
+            bool inRightColumn = lead.X > pageW * 0.46;
+            double maxVerticalGap = Math.Max(lead.FontSize * 1.3, 14.0);
+
+            var prevLine = lead;
+            for (int k = 0; k < 5; k++)
+            {
+                ParsedTextSpan? nextLine = null;
+                double minGap = double.MaxValue;
+
+                foreach (var cand in textSpans)
+                {
+                    if (ReferenceEquals(cand, prevLine) || lines.Contains(cand))
+                        continue;
+                    if (IsCaptionText(cand.Text) || FigureNumberNormalizer.IsNonFigureArtifactCaption(cand.Text))
+                        continue;
+                    if (cand.FontSize > lead.FontSize + 1.5)
+                        continue;
+
+                    if (lead.Width >= 80 && cand.X > lead.Right - 4)
+                        continue;
+                    if (inLeftColumn && cand.Right > pageW * 0.54)
+                        continue;
+                    if (inRightColumn && cand.X < lead.X - 18)
+                        continue;
+
+                    double verticalGap = cand.Y - prevLine.Bottom;
+                    if (verticalGap < -2 || verticalGap > maxVerticalGap)
+                        continue;
+
+                    bool alignedWithLead = Math.Abs(cand.X - lead.X) <= 32 ||
+                                           (cand.X >= lead.X - 16 && cand.Right <= lead.Right + 65);
+                    if (!alignedWithLead)
+                        continue;
+
+                    if (verticalGap < minGap)
+                    {
+                        minGap = verticalGap;
+                        nextLine = cand;
+                    }
+                }
+
+                if (nextLine is null)
+                    break;
+
+                lines.Add(nextLine);
+                sb.Append(' ').Append(nextLine.Text.Trim());
+                prevLine = nextLine;
+            }
+
+            string mergedText = sb.ToString().Trim();
+            if (!FigureNumberNormalizer.TryParseFigureCaption(mergedText, out var finalParsed))
+                continue;
+
+            double minX = lines.Min(l => l.X);
+            double minY = lines.Min(l => l.Y);
+            double maxX = lines.Max(l => l.Right);
+            double maxY = lines.Max(l => l.Bottom);
+            var capBox = ClampToPage(new BoundingBox(minX, minY, Math.Max(4, maxX - minX), Math.Max(6, maxY - minY)), pageW, pageH);
+            anchors.Add(new PageCaptionAnchor(mergedText, capBox, finalParsed));
+        }
+
+        return anchors;
+    }
+
+    private static bool HasUnfinishedPrecedingProseLine(ParsedTextSpan lead, IReadOnlyList<ParsedTextSpan> textSpans)
+    {
+        foreach (var prev in textSpans)
+        {
+            if (ReferenceEquals(prev, lead)) continue;
+            double vGap = lead.Y - prev.Bottom;
+            if (vGap < -2 || vGap > Math.Max(lead.FontSize * 0.65, 8.0)) continue;
+            if (Math.Abs(prev.X - lead.X) > 10.0 || Math.Abs(prev.FontSize - lead.FontSize) > 0.7) continue;
+            string t = prev.Text.Trim();
+            if (t.Length < 25) continue;
+            char last = t[^1];
+            if (last is not ('.' or ':' or '?' or '!'))
+                return true;
+        }
+        return false;
+    }
+
+    internal static List<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source, PageCaptionAnchor? Anchor)>
+        AssignCaptionsToPageFigures(
+            IReadOnlyList<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source)> trimmedRegions,
+            IReadOnlyList<ParsedTextSpan> textSpans,
+            double pageW,
+            double pageH,
+            string? dominantVocabPrefix = null)
+    {
+        var regions = trimmedRegions.ToList();
+        var anchors = ExtractPageCaptionAnchors(textSpans, pageW, pageH);
+
+        // Multi-panel fusion: if two adjacent figures sit side-by-side under a single spanning caption, fuse them once
+        if (regions.Count >= 2 && anchors.Count > 0 && anchors.Count < regions.Count)
+        {
+            var mergedIndices = new HashSet<int>();
+            var fusedList = new List<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source)>();
+
+            for (int cIdx = 0; cIdx < anchors.Count; cIdx++)
+            {
+                var cap = anchors[cIdx];
+                var spanningMembers = new List<int>();
+                for (int rIdx = 0; rIdx < regions.Count; rIdx++)
+                {
+                    if (mergedIndices.Contains(rIdx)) continue;
+                    var box = regions[rIdx].Box;
+                    double dyBelow = cap.Box.Y - box.Bottom;
+                    double hOverlap = Math.Min(box.Right, cap.Box.Right) - Math.Max(box.X, cap.Box.X);
+                    if (dyBelow >= -24 && dyBelow <= 85 && hOverlap >= 16)
+                        spanningMembers.Add(rIdx);
+                }
+
+                if (spanningMembers.Count == 2)
+                {
+                    var b0 = regions[spanningMembers[0]];
+                    var b1 = regions[spanningMembers[1]];
+                    double hGap = Math.Max(0, Math.Max(b0.Box.X, b1.Box.X) - Math.Min(b0.Box.Right, b1.Box.Right));
+                    double vOverlap = Math.Min(b0.Box.Bottom, b1.Box.Bottom) - Math.Max(b0.Box.Y, b1.Box.Y);
+                    double minX = Math.Min(b0.Box.X, b1.Box.X);
+                    double minY = Math.Min(b0.Box.Y, b1.Box.Y);
+                    double maxX = Math.Max(b0.Box.Right, b1.Box.Right);
+                    double maxY = Math.Max(b0.Box.Bottom, b1.Box.Bottom);
+                    double unionW = maxX - minX;
+                    double unionH = maxY - minY;
+
+                    bool neitherHasCloserOwnCap = !anchors.Where((_, idx) => idx != cIdx).Any(other =>
+                        TryScoreCaptionMatch(b0.Box, other, dominantVocabPrefix, out _) ||
+                        TryScoreCaptionMatch(b1.Box, other, dominantVocabPrefix, out _));
+
+                    if (neitherHasCloserOwnCap && hGap <= 42 && vOverlap >= 24 &&
+                        unionW <= pageW * 0.94 && unionH <= pageH * 0.88)
+                    {
+                        mergedIndices.Add(spanningMembers[0]);
+                        mergedIndices.Add(spanningMembers[1]);
+                        fusedList.Add((
+                            ClampToPage(new BoundingBox(minX, minY, unionW, unionH), pageW, pageH),
+                            Math.Max(b0.Confidence, b1.Confidence),
+                            b0.Category,
+                            DetectionSource.Hybrid));
+                    }
+                }
+            }
+
+            if (mergedIndices.Count > 0)
+            {
+                for (int i = 0; i < regions.Count; i++)
+                    if (!mergedIndices.Contains(i)) fusedList.Add(regions[i]);
+                regions = fusedList.OrderBy(r => r.Box.Y).ThenBy(r => r.Box.X).ToList();
+            }
+        }
+
+        // Exclusive 1-to-1 bipartite caption matching by lowest score
+        var pairs = new List<(int FigIdx, int CapIdx, double Score)>();
+        for (int f = 0; f < regions.Count; f++)
+        {
+            for (int c = 0; c < anchors.Count; c++)
+            {
+                if (TryScoreCaptionMatch(regions[f].Box, anchors[c], dominantVocabPrefix, out double score))
+                    pairs.Add((f, c, score));
+            }
+        }
+
+        pairs.Sort((a, b) =>
+        {
+            int cmp = a.Score.CompareTo(b.Score);
+            if (cmp != 0) return cmp;
+            cmp = a.FigIdx.CompareTo(b.FigIdx);
+            return cmp != 0 ? cmp : a.CapIdx.CompareTo(b.CapIdx);
+        });
+
+        var figAssigned = new PageCaptionAnchor?[regions.Count];
+        var capTaken = new bool[anchors.Count];
+        foreach (var (figIdx, capIdx, _) in pairs)
+        {
+            if (figAssigned[figIdx] is not null || capTaken[capIdx])
+                continue;
+            figAssigned[figIdx] = anchors[capIdx];
+            capTaken[capIdx] = true;
+        }
+
+        var result = new List<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source, PageCaptionAnchor? Anchor)>(regions.Count);
+        for (int f = 0; f < regions.Count; f++)
+        {
+            var r = regions[f];
+            result.Add((r.Box, r.Confidence, r.Category, r.Source, figAssigned[f]));
+        }
+        return result;
+    }
+
+    private static bool TryScoreCaptionMatch(
+        BoundingBox box,
+        PageCaptionAnchor anchor,
+        string? dominantVocabPrefix,
+        out double score)
+    {
+        score = double.MaxValue;
+        var cap = anchor.Box;
+        double spanRight = cap.X + Math.Max(cap.Width, 60);
+        bool horizAligned = spanRight >= box.X - 70 && cap.X <= box.Right + 70;
+        double horizOverlap = Math.Min(box.Right, cap.Right) - Math.Max(box.X, cap.X);
+
+        double dist = double.MaxValue;
+        if (horizAligned)
+        {
+            double dyBelow = cap.Y - box.Bottom;
+            double dyAbove = box.Y - cap.Bottom;
+            if (dyBelow >= -36 && dyBelow <= 95 && cap.Y >= box.Y + box.Height * 0.45)
+                dist = Math.Abs(dyBelow) + (horizOverlap > 0 ? 0.0 : 14.0);
+            else if (dyAbove >= -28 && dyAbove <= 65 && cap.Bottom <= box.Y + box.Height * 0.55)
+                dist = Math.Abs(dyAbove) + 12.0 + (horizOverlap > 0 ? 0.0 : 14.0);
+        }
+
+        // Side-column caption fallback (adjacent column with >=25% vertical overlap and <=55pt horizontal gap)
+        if (dist == double.MaxValue)
+        {
+            double vertOverlap = Math.Min(box.Bottom, cap.Bottom) - Math.Max(box.Y, cap.Y);
+            double minH = Math.Min(box.Height, cap.Height);
+            if (vertOverlap >= Math.Max(6.0, minH * 0.5))
+            {
+                double horizGap = cap.X >= box.Right
+                    ? cap.X - box.Right
+                    : (box.X >= cap.Right ? box.X - cap.Right : 0.0);
+                if (horizGap >= -16 && horizGap <= 55)
+                    dist = Math.Max(0.0, horizGap) + 22.0;
+            }
+        }
+
+        if (dist == double.MaxValue)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(dominantVocabPrefix) &&
+            string.Equals(anchor.Parsed.Prefix, dominantVocabPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            dist -= 6.0;
+        }
+
+        score = dist;
+        return true;
+    }
+
     private static (string? CaptionText, BoundingBox? CaptionBox) FindNearestCaptionWithBox(
+        BoundingBox box,
+        IReadOnlyList<ParsedTextSpan> textSpans,
+        double pageW,
+        double pageH,
+        string? dominantVocabPrefix = null)
+    {
+        var anchors = ExtractPageCaptionAnchors(textSpans, pageW, pageH);
+        PageCaptionAnchor? best = null;
+        double bestScore = double.MaxValue;
+        foreach (var a in anchors)
+        {
+            if (TryScoreCaptionMatch(box, a, dominantVocabPrefix, out double score) && score < bestScore)
+            {
+                bestScore = score;
+                best = a;
+            }
+        }
+        return best is null ? (null, null) : (best.Text, best.Box);
+    }
+
+    private static string? FindNearestNonFigureCaption(
         BoundingBox box,
         IReadOnlyList<ParsedTextSpan> textSpans,
         double pageW,
         double pageH)
     {
-        int bestIdx = -1;
+        string? best = null;
         double bestDist = double.MaxValue;
 
-        for (int i = 0; i < textSpans.Count; i++)
+        foreach (var span in textSpans)
         {
-            var span = textSpans[i];
-            if (!IsCaptionText(span.Text))
+            if (!FigureNumberNormalizer.IsNonFigureArtifactCaption(span.Text))
                 continue;
 
             double spanRight = span.X + Math.Max(span.Width, 60);
-            bool horizAligned = spanRight >= box.X - 70 && span.X <= box.Right + 70;
+            bool horizAligned = spanRight >= box.X - 55 && span.X <= box.Right + 55;
             if (!horizAligned)
                 continue;
 
-            double dyBelow = span.Y - box.Bottom;
+            bool insideTopBand = span.Y >= box.Y - 6 && span.Bottom <= box.Y + Math.Min(48.0, box.Height * 0.45);
             double dyAbove = box.Y - span.Bottom;
-            double dist = double.MaxValue;
+            double dyBelow = span.Y - box.Bottom;
 
-            if (dyBelow >= -36 && dyBelow <= 75 && span.Y >= box.Y + box.Height * 0.45)
-                dist = Math.Abs(dyBelow);
-            else if (dyAbove >= -28 && dyAbove <= 50 && span.Bottom <= box.Y + box.Height * 0.55)
-                dist = Math.Abs(dyAbove) + 12;
+            double dist = double.MaxValue;
+            if (insideTopBand)
+                dist = Math.Max(0, span.Y - box.Y);
+            else if (dyAbove >= -24 && dyAbove <= 55 && span.Bottom <= box.Y + box.Height * 0.45)
+                dist = Math.Abs(dyAbove);
+            else if (dyBelow >= -24 && dyBelow <= 55 && span.Y >= box.Y + box.Height * 0.55)
+                dist = Math.Abs(dyBelow) + 6;
 
             if (dist < bestDist)
             {
                 bestDist = dist;
-                bestIdx = i;
+                best = span.Text.Trim();
             }
         }
 
-        if (bestIdx < 0)
-            return (null, null);
-
-        var lead = textSpans[bestIdx];
-        var lines = new List<ParsedTextSpan> { lead };
-        var sb = new StringBuilder(lead.Text.Trim());
-
-        bool isTableCaption = lead.Text.TrimStart().StartsWith("table", StringComparison.OrdinalIgnoreCase);
-        bool inLeftColumn = lead.Right < pageW * 0.52 && box.Right < pageW * 0.54;
-        bool inRightColumn = lead.X > pageW * 0.46 && box.X > pageW * 0.44;
-        double maxVerticalGap = isTableCaption
-            ? Math.Max(lead.FontSize * 0.85, 9.0)
-            : Math.Max(lead.FontSize * 1.3, 14.0);
-
-        var prevLine = lead;
-        for (int k = 0; k < 4; k++)
-        {
-            ParsedTextSpan? nextLine = null;
-            double minGap = double.MaxValue;
-
-            foreach (var cand in textSpans)
-            {
-                if (ReferenceEquals(cand, prevLine) || lines.Contains(cand))
-                    continue;
-                if (IsCaptionText(cand.Text))
-                    continue;
-                if (cand.FontSize > lead.FontSize + 1.5)
-                    continue;
-                if (isTableCaption && Math.Abs(cand.FontSize - lead.FontSize) > 1.2)
-                    continue;
-
-                if (lead.Width >= 80 && cand.X > lead.Right - 4)
-                    continue;
-                if (inLeftColumn && cand.Right > pageW * 0.54)
-                    continue;
-                if (inRightColumn && cand.X < lead.X - 18)
-                    continue;
-
-                double verticalGap = cand.Y - prevLine.Bottom;
-                if (verticalGap < -2 || verticalGap > maxVerticalGap)
-                    continue;
-
-                bool alignedWithLead = Math.Abs(cand.X - lead.X) <= 32 ||
-                                       (cand.X >= lead.X - 16 && cand.Right <= Math.Max(box.Right + 24, lead.Right + 40));
-                if (!alignedWithLead)
-                    continue;
-
-                if (isTableCaption)
-                {
-                    int sameRowCells = 0;
-                    foreach (var rowSpan in textSpans)
-                    {
-                        if (Math.Abs(rowSpan.Y - cand.Y) <= 4.0 &&
-                            rowSpan.Right >= box.X - 10 &&
-                            rowSpan.X <= box.Right + 10)
-                        {
-                            sameRowCells++;
-                        }
-                    }
-
-                    if (sameRowCells >= 2)
-                        continue;
-                }
-
-                if (verticalGap < minGap)
-                {
-                    minGap = verticalGap;
-                    nextLine = cand;
-                }
-            }
-
-            if (nextLine is null)
-                break;
-
-            lines.Add(nextLine);
-            sb.Append(' ').Append(nextLine.Text.Trim());
-            prevLine = nextLine;
-        }
-
-        double minX = lines.Min(l => l.X);
-        double minY = lines.Min(l => l.Y);
-        double maxX = lines.Max(l => l.Right);
-        double maxY = lines.Max(l => l.Bottom);
-
-        var capBox = ClampToPage(new BoundingBox(minX, minY, Math.Max(4, maxX - minX), Math.Max(6, maxY - minY)), pageW, pageH);
-        return (sb.ToString().Trim(), capBox);
+        _ = pageW;
+        _ = pageH;
+        return best;
     }
 
     private static BoundingBox ExpandBoxWithAttachedLabels(

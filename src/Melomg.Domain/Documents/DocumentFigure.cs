@@ -3,9 +3,9 @@ using Melomg.Domain.Errors;
 
 namespace Melomg.Domain.Documents;
 
-public enum FigureCategory { Figure, Chart, Diagram, Table, Formula }
+public enum FigureCategory { Figure, Diagram, Chart }
 
-public enum DetectionSource { OnnxModel, PdfXObject, Hybrid, Manual }
+public enum DetectionSource { OnnxModel, PageLayout, Hybrid, Manual }
 
 public sealed class DocumentFigure : IIndexedEntity
 {
@@ -15,13 +15,15 @@ public sealed class DocumentFigure : IIndexedEntity
         string id, string documentId, int index, int pageNumber, int pageFigureIndex,
         FigureCategory category, BoundingBox boundingBox, double confidence,
         string? caption, string label, DetectionSource source,
-        string? lastExtractedPath, BoundingBox? captionBoundingBox, List<FigureLabelMask> labelMasks)
+        string? lastExtractedPath, BoundingBox? captionBoundingBox, List<FigureLabelMask> labelMasks,
+        string? vocabPrefix, string? figureNumber, string? normalizedNumber)
     {
         Id = id; DocumentId = documentId; Index = index; PageNumber = pageNumber;
         PageFigureIndex = pageFigureIndex; Category = category; BoundingBox = boundingBox;
         Confidence = confidence; Caption = caption; Label = label; Source = source;
         LastExtractedPath = lastExtractedPath; CaptionBoundingBox = captionBoundingBox;
         _labelMasks = labelMasks;
+        VocabPrefix = vocabPrefix; FigureNumber = figureNumber; NormalizedNumber = normalizedNumber;
     }
 
     public string Id { get; private set; }
@@ -37,6 +39,9 @@ public sealed class DocumentFigure : IIndexedEntity
     public DetectionSource Source { get; private set; }
     public string? LastExtractedPath { get; private set; }
     public BoundingBox? CaptionBoundingBox { get; private set; }
+    public string? VocabPrefix { get; private set; }
+    public string? FigureNumber { get; private set; }
+    public string? NormalizedNumber { get; private set; }
     public IReadOnlyList<FigureLabelMask> LabelMasks => _labelMasks;
 
     public void SetIndexInternal(int index) => Index = index;
@@ -46,7 +51,8 @@ public sealed class DocumentFigure : IIndexedEntity
         string id, string documentId, int pageNumber, FigureCategory category,
         BoundingBox boundingBox, PdfPageInfo page, double confidence,
         string? caption, string? label, DetectionSource source,
-        BoundingBox? captionBoundingBox = null, IEnumerable<FigureLabelMask>? labelMasks = null)
+        BoundingBox? captionBoundingBox = null, IEnumerable<FigureLabelMask>? labelMasks = null,
+        string? vocabPrefix = null, string? figureNumber = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(id);
         ArgumentException.ThrowIfNullOrWhiteSpace(documentId);
@@ -67,23 +73,69 @@ public sealed class DocumentFigure : IIndexedEntity
             return FigureErrors.InvalidConfidence(confidence);
 
         var normalizedCaption = string.IsNullOrWhiteSpace(caption) ? null : caption.Trim();
-        var resolvedLabel = string.IsNullOrWhiteSpace(label) ? $"{category} p{pageNumber}" : label.Trim();
+        var (resolvedPrefix, resolvedNum, resolvedNorm, parsedShortLabel) = ResolveVocabularyMetadata(
+            vocabPrefix, figureNumber, normalizedCaption, label);
+
+        var resolvedLabel = !string.IsNullOrWhiteSpace(label)
+            ? label.Trim()
+            : parsedShortLabel ?? $"{category} p{pageNumber}";
+
         var maskList = labelMasks is null ? [] : labelMasks.OrderBy(m => m.Index).ToList();
 
         return new DocumentFigure(
             id.Trim(), documentId.Trim(), 1, pageNumber, 1, category, boundingBox,
-            Math.Round(confidence, 4), normalizedCaption, resolvedLabel, source, null, captionBoundingBox, maskList);
+            Math.Round(confidence, 4), normalizedCaption, resolvedLabel, source, null, captionBoundingBox, maskList,
+            resolvedPrefix, resolvedNum, resolvedNorm);
     }
 
     public static DocumentFigure Rehydrate(
         string id, string documentId, int index, int pageNumber, int pageFigureIndex,
         FigureCategory category, BoundingBox boundingBox, double confidence,
         string? caption, string label, DetectionSource source, string? lastExtractedPath,
-        BoundingBox? captionBoundingBox = null, IEnumerable<FigureLabelMask>? labelMasks = null) =>
-        new(
+        BoundingBox? captionBoundingBox = null, IEnumerable<FigureLabelMask>? labelMasks = null,
+        string? vocabPrefix = null, string? figureNumber = null, string? normalizedNumber = null)
+    {
+        var (resolvedPrefix, resolvedNum, resolvedNorm, _) = ResolveVocabularyMetadata(
+            vocabPrefix, figureNumber, caption, label);
+        if (!string.IsNullOrWhiteSpace(normalizedNumber))
+            resolvedNorm = FigureNumberNormalizer.NormalizeLookupNumber(normalizedNumber);
+
+        return new(
             id, documentId, index, pageNumber, pageFigureIndex, category, boundingBox, confidence,
             caption, label, source, lastExtractedPath, captionBoundingBox,
-            labelMasks is null ? [] : [.. labelMasks.OrderBy(m => m.Index)]);
+            labelMasks is null ? [] : [.. labelMasks.OrderBy(m => m.Index)],
+            resolvedPrefix, resolvedNum, resolvedNorm);
+    }
+
+    private static (string? Prefix, string? Number, string? Normalized, string? ShortLabel) ResolveVocabularyMetadata(
+        string? explicitPrefix, string? explicitNumber, string? caption, string? label)
+    {
+        string? prefix = string.IsNullOrWhiteSpace(explicitPrefix) ? null : explicitPrefix.Trim();
+        string? num = string.IsNullOrWhiteSpace(explicitNumber) ? null : explicitNumber.Trim();
+        string? shortLabel = null;
+
+        if (FigureNumberNormalizer.TryParseFigureCaption(caption, out var capParsed))
+        {
+            prefix ??= capParsed.Prefix;
+            num ??= capParsed.Number;
+            shortLabel = capParsed.ShortLabel;
+        }
+        else if (FigureNumberNormalizer.TryParseFigureCaption(label, out var lblParsed))
+        {
+            prefix ??= lblParsed.Prefix;
+            num ??= lblParsed.Number;
+            shortLabel = lblParsed.ShortLabel;
+        }
+
+        string? norm = string.IsNullOrWhiteSpace(num) ? null : FigureNumberNormalizer.NormalizeLookupNumber(num);
+        if (string.IsNullOrWhiteSpace(norm))
+        {
+            num = null;
+            norm = null;
+        }
+
+        return (prefix, num, norm, shortLabel);
+    }
 
     public Result UpdateBoundingBox(BoundingBox newBox, PdfPageInfo page)
     {
@@ -146,6 +198,12 @@ public sealed class DocumentFigure : IIndexedEntity
     {
         if (string.IsNullOrWhiteSpace(caption)) return FigureErrors.EmptyCaption();
         Caption = caption.Trim();
+        if (FigureNumberNormalizer.TryParseFigureCaption(Caption, out var parsed))
+        {
+            VocabPrefix = parsed.Prefix;
+            FigureNumber = parsed.Number;
+            NormalizedNumber = parsed.NormalizedNumber;
+        }
         return Result.Success();
     }
 
@@ -153,6 +211,39 @@ public sealed class DocumentFigure : IIndexedEntity
     {
         if (string.IsNullOrWhiteSpace(label)) return FigureErrors.EmptyLabel();
         Label = label.Trim();
+        if (FigureNumberNormalizer.TryParseFigureCaption(Label, out var parsed))
+        {
+            VocabPrefix ??= parsed.Prefix;
+            if (string.IsNullOrWhiteSpace(FigureNumber))
+            {
+                FigureNumber = parsed.Number;
+                NormalizedNumber = parsed.NormalizedNumber;
+            }
+        }
+        return Result.Success();
+    }
+
+    public Result SetFigureNumber(string? figureNumber, string? vocabPrefix = null)
+    {
+        if (string.IsNullOrWhiteSpace(figureNumber))
+        {
+            FigureNumber = null;
+            NormalizedNumber = null;
+            if (!string.IsNullOrWhiteSpace(vocabPrefix))
+                VocabPrefix = vocabPrefix.Trim();
+            return Result.Success();
+        }
+
+        string trimmed = figureNumber.Trim();
+        string norm = FigureNumberNormalizer.NormalizeLookupNumber(trimmed);
+        if (string.IsNullOrWhiteSpace(norm))
+            return FigureErrors.EmptyLabel();
+
+        if (!string.IsNullOrWhiteSpace(vocabPrefix))
+            VocabPrefix = vocabPrefix.Trim();
+
+        FigureNumber = trimmed;
+        NormalizedNumber = norm;
         return Result.Success();
     }
 
@@ -168,11 +259,9 @@ public sealed class DocumentFigure : IIndexedEntity
     {
         (bool ok, category) = raw.Trim().ToLowerInvariant() switch
         {
-            "figure" or "fig" or "image" => (true, FigureCategory.Figure),
+            "figure" or "fig" or "image" or "img" or "illustration" or "plate" => (true, FigureCategory.Figure),
+            "diagram" or "flowchart" or "schematic" or "scheme" => (true, FigureCategory.Diagram),
             "chart" or "plot" or "graph" => (true, FigureCategory.Chart),
-            "diagram" or "flowchart" => (true, FigureCategory.Diagram),
-            "table" => (true, FigureCategory.Table),
-            "formula" or "equation" => (true, FigureCategory.Formula),
             _ => (false, default(FigureCategory))
         };
         return ok;
@@ -183,7 +272,7 @@ public sealed class DocumentFigure : IIndexedEntity
         (bool ok, source) = raw.Trim().ToLowerInvariant() switch
         {
             "onnx" or "onnxmodel" => (true, DetectionSource.OnnxModel),
-            "pdf-xobject" or "pdfxobject" => (true, DetectionSource.PdfXObject),
+            "page-layout" or "pagelayout" or "pdf-xobject" or "pdfxobject" => (true, DetectionSource.PageLayout),
             "hybrid" => (true, DetectionSource.Hybrid),
             "manual" => (true, DetectionSource.Manual),
             _ => (false, DetectionSource.OnnxModel)
@@ -193,7 +282,7 @@ public sealed class DocumentFigure : IIndexedEntity
 
     public static string FormatSourceTag(DetectionSource source) => source switch
     {
-        DetectionSource.PdfXObject => "pdf-xobject",
+        DetectionSource.PageLayout => "page-layout",
         DetectionSource.Hybrid => "hybrid",
         DetectionSource.Manual => "manual",
         _ => "onnx"

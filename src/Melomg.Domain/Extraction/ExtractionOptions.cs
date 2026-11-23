@@ -17,11 +17,14 @@ public sealed record ExtractionOptions(
     ObfuscationStyle ObfuscationStyle = ObfuscationStyle.Solid,
     string ObfuscationColorHex = FigureLabelMask.DefaultSolidColorHex,
     int Quality = ExtractionOptions.DefaultQuality,
-    bool IncludeMetadata = false)
+    bool IncludeMetadata = false,
+    string NamingMode = ExtractionOptions.DefaultNamingMode,
+    bool EmitManifest = false)
 {
     public const int DefaultDpi = 150;
     public const int DefaultPaddingPx = 8;
     public const int DefaultQuality = 90;
+    public const string DefaultNamingMode = "number";
     private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(250);
 
     public static Result<ExtractionOptions> Create(
@@ -35,7 +38,9 @@ public sealed record ExtractionOptions(
         string? obfuscateStyle = null,
         string? obfuscateColorHex = null,
         string? quality = null,
-        bool includeMetadata = false)
+        bool includeMetadata = false,
+        string? namingMode = null,
+        bool emitManifest = false)
     {
         var baseRes = ValidateFormatQualityAndDpi(format, dpi, quality);
         if (!baseRes.IsSuccess) return baseRes.Error!;
@@ -52,9 +57,14 @@ public sealed record ExtractionOptions(
         if (!string.IsNullOrWhiteSpace(obfuscateColorHex) && !FigureLabelMask.TryNormalizeColorHex(obfuscateColorHex, out resolvedColor))
             return FigureErrors.InvalidColorHex(obfuscateColorHex);
 
+        string resolvedNaming = string.IsNullOrWhiteSpace(namingMode) ? DefaultNamingMode : namingMode.Trim().ToLowerInvariant();
+        if (resolvedNaming is not ("number" or "id"))
+            return FigureErrors.InvalidNamingMode(namingMode ?? string.Empty);
+
         return new ExtractionOptions(
             normalizedFormat, effectiveDpi, paddingPx, includeCaption, obfuscateAllLabels,
-            ParsePatterns(obfuscateLabelPatterns), ignoreSavedMasks, parsedStyle, resolvedColor, resolvedQuality, includeMetadata);
+            ParsePatterns(obfuscateLabelPatterns), ignoreSavedMasks, parsedStyle, resolvedColor, resolvedQuality,
+            includeMetadata, resolvedNaming, emitManifest);
     }
 
     internal static Result<(string Format, int Dpi, int Quality)> ValidateFormatQualityAndDpi(string? format, int? dpi, string? quality)

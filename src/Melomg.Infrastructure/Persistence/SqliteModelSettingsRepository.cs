@@ -41,13 +41,17 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
                 CREATE TABLE IF NOT EXISTS DocumentRegistry (
                     DocumentId TEXT PRIMARY KEY, Title TEXT NOT NULL, PageCount INTEGER NOT NULL, FigureCount INTEGER NOT NULL,
                     ModelName TEXT NOT NULL, ConfidenceThreshold REAL NOT NULL, DbPath TEXT NOT NULL,
-                    StorageDirectory TEXT NOT NULL, IngestedAtUtc TEXT NOT NULL, WorkspaceMode TEXT NOT NULL DEFAULT 'standard'
+                    StorageDirectory TEXT NOT NULL, IngestedAtUtc TEXT NOT NULL, WorkspaceMode TEXT NOT NULL DEFAULT 'standard',
+                    VocabPrimaryPrefix TEXT NULL
                 );
                 CREATE TABLE IF NOT EXISTS FigureEntityIndex (FigureId TEXT PRIMARY KEY, DocumentId TEXT NOT NULL);
                 """;
             await cmd.ExecuteNonQueryAsync(cancellationToken);
 
-            await EnsureColumnsAsync(conn, "DocumentRegistry", [("WorkspaceMode", "TEXT NOT NULL DEFAULT 'standard'")], cancellationToken);
+            await EnsureColumnsAsync(conn, "DocumentRegistry", [
+                ("WorkspaceMode", "TEXT NOT NULL DEFAULT 'standard'"),
+                ("VocabPrimaryPrefix", "TEXT NULL")
+            ], cancellationToken);
             _initialized = true;
         }
         finally
@@ -112,7 +116,7 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
         bool isBuiltIn = reader.GetInt32(2) != 0;
         string modelPath = isBuiltIn ? options.BuiltInModelPath : reader.GetString(1);
         var classes = JsonSerializer.Deserialize(reader.GetString(9), ModelSettingsJsonContext.Default.ListString)
-            ?? ["figure", "chart", "diagram", "table", "formula"];
+            ?? ["figure", "diagram", "chart"];
 
         return OnnxModelProfile.Rehydrate(
             reader.GetString(0), modelPath, isBuiltIn, reader.GetDouble(3), reader.GetDouble(4),

@@ -162,11 +162,14 @@ public sealed class OnnxRuntimeAndYoloTests
         Assert.True(padX > 165f && padX < 175f);
         Assert.Equal(0f, tensor[0] - (114f / 255f), 2); // top-left margin padded with 114/255
 
-        // 2. YOLOv10 [1, 4, 6] output with DocStructBench classes:
-        //    row 0: figure (cls 3, score 0.91)
-        //    row 1: plain text (cls 1, score 0.95) -> must be ignored
+        // 2. YOLOv10 [1, 7, 6] output with DocStructBench classes:
+        //    row 0: figure (cls 3, score 0.91) -> kept
+        //    row 1: plain text (cls 1, score 0.95) -> ignored
         //    row 2: figure_caption (cls 4, score 0.88) -> must appear in CaptionNormalizedBoxes
-        //    row 3: table (cls 5, score 0.84) -> must map to FigureCategory.Table
+        //    row 3: table (cls 5, score 0.84) -> structurally dropped (0 figures)
+        //    row 4: table_caption (cls 6, score 0.89) -> structurally dropped (0 captions)
+        //    row 5: isolate_formula (cls 8, score 0.92) -> structurally dropped (0 figures)
+        //    row 6: formula_caption (cls 9, score 0.87) -> structurally dropped (0 captions)
         float x1 = padX + 50f * scale;
         float x2 = padX + 350f * scale;
         var v10Out = new float[]
@@ -174,12 +177,15 @@ public sealed class OnnxRuntimeAndYoloTests
             x1, 100f * scale, x2, 400f * scale, 0.91f, 3f,
             x1, 20f  * scale, x2, 80f  * scale, 0.95f, 1f,
             x1, 410f * scale, x2, 460f * scale, 0.88f, 4f,
-            x1, 500f * scale, x2, 750f * scale, 0.84f, 5f
+            x1, 500f * scale, x2, 750f * scale, 0.84f, 5f,
+            x1, 470f * scale, x2, 495f * scale, 0.89f, 6f,
+            x1, 760f * scale, x2, 820f * scale, 0.92f, 8f,
+            x1, 825f * scale, x2, 850f * scale, 0.87f, 9f
         };
 
         var decodedV10 = NativeOnnxRuntimeSessionHost.DecodeYoloOutput(
             v10Out,
-            [1, 4, 6],
+            [1, 7, 6],
             1024,
             1024,
             scale,
@@ -190,13 +196,21 @@ public sealed class OnnxRuntimeAndYoloTests
             confidenceThreshold: 0.35,
             iouThreshold: 0.45);
 
-        Assert.Equal(2, decodedV10.Figures.Count);
+        Assert.Single(decodedV10.Figures);
         Assert.Equal(FigureCategory.Figure, decodedV10.Figures[0].Category);
         Assert.Equal(0.91, decodedV10.Figures[0].Confidence, 2);
         Assert.InRange(decodedV10.Figures[0].NormalizedBox.X, 0.11, 0.14);
         Assert.InRange(decodedV10.Figures[0].NormalizedBox.Width, 0.72, 0.77);
-        Assert.Equal(FigureCategory.Table, decodedV10.Figures[1].Category);
         Assert.Single(decodedV10.CaptionNormalizedBoxes);
+
+        // Custom model profile with disallowed class label ("callout_box") also yields 0 figures
+        var boxDecoded = NativeOnnxRuntimeSessionHost.DecodeYoloOutput(
+            [512f, 512f, 200f, 150f, 0.9f, 0.9f],
+            [1, 1, 6],
+            1024, 1024, 1f, 0f, 0f, 1024, 1024,
+            0.35, 0.45,
+            customClasses: ["callout_box"]);
+        Assert.Empty(boxDecoded.Figures);
 
         // 3. YOLOv8 transposed [1, 4 + 2, 2] where anchor 0 & anchor 1 heavily overlap (conf 0.89 vs 0.62) -> NMS keeps 1
         var v8Out = new float[6 * 2];

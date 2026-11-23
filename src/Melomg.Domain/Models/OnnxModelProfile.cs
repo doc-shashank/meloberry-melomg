@@ -12,7 +12,7 @@ public sealed class OnnxModelProfile
     public const double DefaultIouThreshold = 0.45;
     public const int DefaultInputSize = 640;
     public const int DefaultOpsetVersion = 17;
-    private static readonly string[] DefaultClasses = ["figure", "chart", "diagram", "table", "formula"];
+    private static readonly string[] DefaultClasses = ["figure", "diagram", "chart"];
 
     private readonly List<string> _supportedClasses;
 

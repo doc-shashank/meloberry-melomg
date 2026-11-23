@@ -152,21 +152,44 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             renderSession is not null;
         string actualInferenceEngine = "managed-fallback";
 
+        var scenes = new List<ParsedPageScene>(docIndex.OrderedPageIds.Count);
+        var scannedPrefixCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < docIndex.OrderedPageIds.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int pageNum = i + 1;
+            var scene = sceneMap.GetOrAdd(pageNum, p =>
+                ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[p - 1], p) is { IsSuccess: true } ok
+                    ? ok.Value
+                    : null!);
+            if (scene is null)
+            {
+                var sceneResult = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[i], pageNum);
+                return sceneResult.Error!;
+            }
+
+            scenes.Add(scene);
+            foreach (var span in MergeTextSpansOnSameLine(scene.TextSpans, maxGapPts: 14.0))
+            {
+                if (FigureNumberNormalizer.TryParseFigureCaption(span.Text, out var parsedCap))
+                    scannedPrefixCounts[parsedCap.Prefix] = scannedPrefixCounts.GetValueOrDefault(parsedCap.Prefix) + 1;
+            }
+        }
+
+        var scannedPrefixes = scannedPrefixCounts
+            .OrderByDescending(kv => kv.Value)
+            .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => kv.Key)
+            .ToArray();
+        string? dominantPrefix = scannedPrefixes.Length > 0 ? scannedPrefixes[0] : null;
+
         try
         {
-            for (int i = 0; i < docIndex.OrderedPageIds.Count; i++)
+            for (int i = 0; i < scenes.Count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 int pageNum = i + 1;
-                var scene = sceneMap.GetOrAdd(pageNum, p =>
-                    ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[p - 1], p) is { IsSuccess: true } ok
-                        ? ok.Value
-                        : null!);
-                if (scene is null)
-                {
-                    var sceneResult = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[i], pageNum);
-                    return sceneResult.Error!;
-                }
+                var scene = scenes[i];
                 RenderedRgbBitmap? pageBitmap = null;
                 NeuralLayoutOutput? neuralLayout = null;
 
@@ -207,7 +230,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                     modelMeta,
                     effectiveConfidence,
                     modelProfile.IouThreshold,
-                    neuralLayout);
+                    neuralLayout,
+                    dominantPrefix);
                 allCandidates.AddRange(pageCandidates);
             }
         }
@@ -217,6 +241,25 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 await renderSession.DisposeAsync();
         }
 
+        var candidatePrefixCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        int numbered = 0, unnumbered = 0;
+        foreach (var c in allCandidates)
+        {
+            if (!string.IsNullOrWhiteSpace(c.VocabPrefix))
+                candidatePrefixCounts[c.VocabPrefix] = candidatePrefixCounts.GetValueOrDefault(c.VocabPrefix) + 1;
+            if (!string.IsNullOrWhiteSpace(c.FigureNumber)) numbered++;
+            else unnumbered++;
+        }
+        var docPrefixes = candidatePrefixCounts.Count > 0
+            ? candidatePrefixCounts.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).ToArray()
+            : scannedPrefixes;
+        var vocab = new DocumentVocabulary(
+            docPrefixes.Length > 0 ? docPrefixes[0] : null,
+            docPrefixes,
+            numbered == 0 ? "none" : (allCandidates.Any(c => c.FigureNumber is not null && (c.FigureNumber.Contains('.') || c.FigureNumber.Contains('-'))) ? "hierarchical" : "sequential"),
+            numbered,
+            unnumbered);
+
         return new PdfIngestionAnalysis(
             docIndex.SuggestedTitle,
             sha256,
@@ -224,7 +267,9 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             allCandidates,
             modelMeta,
             effectiveConfidence,
-            actualInferenceEngine);
+            actualInferenceEngine,
+            vocab,
+            scannedPrefixes);
     }
 
     public Task<Result> InitializeWorkspaceAsync(
@@ -313,7 +358,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         OnnxModelMetadata modelMeta,
         double confidenceThreshold,
         double iouThreshold,
-        NeuralLayoutOutput? neuralLayout = null)
+        NeuralLayoutOutput? neuralLayout = null,
+        string? dominantVocabPrefix = null)
     {
         double pageW = scene.PageInfo.WidthPts;
         double pageH = scene.PageInfo.HeightPts;
@@ -324,8 +370,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         // 2. Group adjacent image tiles & filter tiny header/icon noise
         var meaningfulImages = FilterAndMergeImagePlacements(scene.ImagePlacements, pageW, pageH);
 
-        // 3. O(N) spatial-grid clustering of vector graphics shapes
-        var vectorClusters = ClusterVectorRegionsGrid(scene.VectorShapes, pageW, pageH);
+        // 3. O(N) spatial-grid clustering of vector graphics shapes (drops tables, booktabs rule-tables, and bordered prose callout boxes)
+        var vectorClusters = ClusterVectorRegionsGrid(scene.VectorShapes, mergedTextSpans, pageW, pageH);
 
         // 4. Fuse composite vector+image diagrams (e.g., labeled multi-panel figures with arrows)
         var (compositeBoxes, consumedImages, consumedVectors) = BuildCompositeRegions(meaningfulImages, vectorClusters, mergedTextSpans, pageW, pageH);
@@ -360,7 +406,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
         List<BoundingBox> visualGraphicRegions = [];
         if (pageBitmap is not null)
-            visualGraphicRegions = AugmentTensorWithRenderedVisualFeatures(tensor, plane, pageBitmap, pageW, pageH);
+            visualGraphicRegions = AugmentTensorWithRenderedVisualFeatures(tensor, plane, pageBitmap, mergedTextSpans, pageW, pageH);
 
         // 6. Execute ONNX layout model inference (prefer real neural ONNX Runtime when installed; managed fallback otherwise)
         IReadOnlyList<OnnxRawDetection> onnxDetections = neuralLayout is not null
@@ -402,7 +448,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             if (consumedImages.Contains(i)) continue;
             var img = meaningfulImages[i];
             if (img.Box.Width < 38 || img.Box.Height < 30) continue;
-            regionList.Add((ClampToPage(img.Box, pageW, pageH), 0.90, FigureCategory.Figure, DetectionSource.PdfXObject));
+            regionList.Add((ClampToPage(img.Box, pageW, pageH), 0.90, FigureCategory.Figure, DetectionSource.PageLayout));
         }
 
         for (int i = 0; i < vectorClusters.Count; i++)
@@ -457,15 +503,15 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 if (neuralLayout is not null)
                 {
                     // When neural ONNX & structural PDF region agree closely, prefer tight structural box if IoU is strong,
-                    // or when neural box bleeds up into running header while structural XObject avoids it
+                    // or when neural box bleeds up into running header while structural page layout avoids it
                     bool preferCleanStructuralHeader =
-                        r.Source == DetectionSource.PdfXObject &&
+                        r.Source == DetectionSource.PageLayout &&
                         onnxBox.Y < 46 &&
                         r.Box.Y >= 46 &&
                         r.Box.ComputeContainment(onnxBox) >= 0.80 &&
                         onnxBox.Width <= r.Box.Width * 1.35;
 
-                    addedBox = (onnxBox.ComputeIoU(r.Box) >= 0.45 && r.Source == DetectionSource.PdfXObject) || preferCleanStructuralHeader
+                    addedBox = (onnxBox.ComputeIoU(r.Box) >= 0.45 && r.Source == DetectionSource.PageLayout) || preferCleanStructuralHeader
                         ? r.Box
                         : onnxBox;
 
@@ -477,7 +523,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 {
                     addedBox = r.Box;
                     double boostedConf = Math.Clamp(0.50 * det.Confidence + 0.50 * Math.Max(r.Confidence, 0.90), 0.0, 0.99);
-                    var src = r.Source == DetectionSource.PdfXObject ? DetectionSource.Hybrid : r.Source;
+                    var src = r.Source == DetectionSource.PageLayout ? DetectionSource.Hybrid : r.Source;
                     fused.Add((addedBox, boostedConf, r.Category, src));
                 }
 
@@ -508,7 +554,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 continue;
 
             var r = regionList[i];
-            if (neuralLayout is null || r.Source == DetectionSource.PdfXObject || r.Confidence >= 0.80)
+            if (neuralLayout is null || r.Source == DetectionSource.PageLayout || r.Confidence >= 0.80)
                 fused.Add(r);
         }
 
@@ -540,18 +586,31 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         var ordered = deduplicated
             .OrderBy(x => x.Box.Y)
             .ThenBy(x => x.Box.X)
+            .Select(x => (
+                Box: TrimRunningHeaderAndFooter(x.Box, pageBitmap, mergedTextSpans, pageW, pageH),
+                x.Confidence,
+                x.Category,
+                x.Source))
             .ToList();
 
-        var candidates = new List<DetectedFigureCandidate>(ordered.Count);
+        var assigned = AssignCaptionsToPageFigures(ordered, mergedTextSpans, pageW, pageH, dominantVocabPrefix);
+
+        var candidates = new List<DetectedFigureCandidate>(assigned.Count);
         int localSeq = 1;
-        foreach (var item in ordered)
+        foreach (var (trimmedBox, confidence, category, source, anchor) in assigned)
         {
-            var trimmedBox = TrimRunningHeaderAndFooter(item.Box, pageBitmap, mergedTextSpans, pageW, pageH);
-            var (captionMatch, captionBox) = FindNearestCaptionWithBox(trimmedBox, mergedTextSpans, pageW, pageH);
+            var captionMatch = anchor?.Text;
+            var captionBox = anchor?.Box;
+
+            // Structural exclusion: discard candidates whose nearest aligned caption belongs to a Table, Box, Equation, or Algorithm
+            if (captionMatch is null && FindNearestNonFigureCaption(trimmedBox, mergedTextSpans, pageW, pageH) is not null)
+                continue;
+
             if (captionBox is null && neuralCaptionBoxes.Count > 0)
                 captionBox = FindNearestNeuralCaptionBox(trimmedBox, neuralCaptionBoxes);
-            var resolvedCategory = RefineCategoryFromCaption(item.Category, captionMatch);
-            var label = ExtractShortLabel(captionMatch) ?? $"{resolvedCategory} p{scene.PageInfo.PageNumber}.{localSeq}";
+            var resolvedCategory = RefineCategoryFromCaption(category, captionMatch);
+            var parsedCap = anchor?.Parsed;
+            var label = parsedCap?.ShortLabel ?? $"{resolvedCategory} p{scene.PageInfo.PageNumber}.{localSeq}";
 
             // Strictly carve matched caption out of crop bounds before & after label expansion and visual ink snapping
             var carvedBox = CarveCaptionOutOfFigureBox(trimmedBox, captionBox, pageW, pageH);
@@ -566,11 +625,13 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 scene.PageInfo.PageNumber,
                 resolvedCategory,
                 refinedBox,
-                Math.Round(item.Confidence, 4),
+                Math.Round(confidence, 4),
                 captionMatch,
                 label,
-                item.Source,
-                captionBox));
+                source,
+                captionBox,
+                parsedCap?.Prefix,
+                parsedCap?.Number));
         }
 
         return AbsorbContainedSubFigures(candidates);
@@ -774,7 +835,11 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         return groups;
     }
 
-    private static List<VectorCluster> ClusterVectorRegionsGrid(IReadOnlyList<ParsedVectorShape> shapes, double pageW, double pageH)
+    private static List<VectorCluster> ClusterVectorRegionsGrid(
+        IReadOnlyList<ParsedVectorShape> shapes,
+        IReadOnlyList<ParsedTextSpan> textSpans,
+        double pageW,
+        double pageH)
     {
         var meaningful = shapes.Where(s =>
         {
@@ -838,6 +903,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             int count = 0;
             int rectCount = 0;
             int lineCount = 0;
+            int thinRuleCount = 0;
 
             while (queue.Count > 0)
             {
@@ -849,6 +915,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 maxY = Math.Max(maxY, shape.Bounds.Bottom);
                 count++;
                 if (shape.IsRectangle) rectCount++;
+                if (Math.Min(shape.Bounds.Width, shape.Bounds.Height) <= 3.5 && Math.Max(shape.Bounds.Width, shape.Bounds.Height) >= 24)
+                    thinRuleCount++;
                 lineCount += Math.Max(1, shape.SegmentCount);
 
                 var (x0, y0, x1, y1) = shapeCells[curr];
@@ -890,12 +958,19 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 continue;
 
             var box = new BoundingBox(Math.Round(minX, 2), Math.Round(minY, 2), Math.Round(w, 2), Math.Round(h, 2));
+
+            // Structurally drop gridded tables, borderless booktabs rule-tables, and bordered prose callout boxes
+            if (rectCount >= count * 0.65 && count >= 4)
+                continue;
+            if (thinRuleCount >= count * 0.70 && IsTabularTextGridInside(box, textSpans))
+                continue;
+            if (rectCount >= 1 && count <= 8 && IsProseCalloutBox(box, textSpans))
+                continue;
+
             double confidence = Math.Clamp(0.68 + Math.Min(count, 16) * 0.018, 0.68, 0.96);
-            FigureCategory? cat = rectCount >= count * 0.7 && count >= 4
-                ? FigureCategory.Table
-                : lineCount >= count * 2
-                    ? FigureCategory.Chart
-                    : FigureCategory.Diagram;
+            FigureCategory? cat = lineCount >= count * 2
+                ? FigureCategory.Chart
+                : FigureCategory.Diagram;
 
             clusters.Add(new VectorCluster(box, count, confidence, cat));
         }
@@ -1053,7 +1128,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         box.ClampToPage(pageW, pageH);
 
     private static bool IsCaptionText(string text) =>
-        !string.IsNullOrWhiteSpace(text) && CaptionRegex().IsMatch(text.TrimStart());
+        FigureNumberNormalizer.TryParseFigureCaption(text, out _);
 
     private static FigureCategory RefineCategoryFromCaption(FigureCategory fallback, string? caption)
     {
@@ -1061,19 +1136,69 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             return fallback;
 
         var lower = caption.TrimStart().ToLowerInvariant();
-        if (lower.StartsWith("table", StringComparison.Ordinal)) return FigureCategory.Table;
-        if (lower.StartsWith("chart", StringComparison.Ordinal) || lower.StartsWith("plot", StringComparison.Ordinal)) return FigureCategory.Chart;
-        if (lower.StartsWith("diagram", StringComparison.Ordinal) || lower.StartsWith("scheme", StringComparison.Ordinal)) return FigureCategory.Diagram;
-        if (lower.StartsWith("eq", StringComparison.Ordinal) || lower.StartsWith("formula", StringComparison.Ordinal)) return FigureCategory.Formula;
-        if (lower.StartsWith("fig", StringComparison.Ordinal)) return fallback == FigureCategory.Table ? FigureCategory.Figure : fallback;
+        if (lower.StartsWith("chart", StringComparison.Ordinal) || lower.StartsWith("plot", StringComparison.Ordinal) || lower.StartsWith("graph", StringComparison.Ordinal))
+            return FigureCategory.Chart;
+        if (lower.StartsWith("diagram", StringComparison.Ordinal) || lower.StartsWith("diag", StringComparison.Ordinal) || lower.StartsWith("scheme", StringComparison.Ordinal))
+            return FigureCategory.Diagram;
         return fallback;
     }
 
-    private static string? ExtractShortLabel(string? caption)
+    private static string? ExtractShortLabel(string? caption) =>
+        FigureNumberNormalizer.TryParseFigureCaption(caption, out var parsed) ? parsed.ShortLabel : null;
+
+    private static bool IsTabularTextGridInside(BoundingBox box, IReadOnlyList<ParsedTextSpan> textSpans)
     {
-        if (string.IsNullOrWhiteSpace(caption)) return null;
-        var m = CaptionRegex().Match(caption.TrimStart());
-        return m.Success ? m.Value.Trim().TrimEnd(':', '.') : null;
+        var inside = textSpans
+            .Where(s => !string.IsNullOrWhiteSpace(s.Text) &&
+                        s.X + s.Width * 0.5 >= box.X - 4 && s.X + s.Width * 0.5 <= box.Right + 4 &&
+                        s.Y + s.EffectiveHeight * 0.5 >= box.Y - 4 && s.Y + s.EffectiveHeight * 0.5 <= box.Bottom + 4)
+            .OrderBy(s => s.Y)
+            .ThenBy(s => s.X)
+            .ToList();
+
+        if (inside.Count < 4) return false;
+
+        int multiColRows = 0;
+        int i = 0;
+        while (i < inside.Count)
+        {
+            double rowY = inside[i].Y;
+            int j = i + 1;
+            while (j < inside.Count && Math.Abs(inside[j].Y - rowY) <= 4.0)
+                j++;
+
+            int cols = 1;
+            double prevRight = inside[i].Right;
+            for (int k = i + 1; k < j; k++)
+            {
+                if (inside[k].X - prevRight >= 12.0)
+                    cols++;
+                prevRight = Math.Max(prevRight, inside[k].Right);
+            }
+            if (cols >= 2) multiColRows++;
+            i = j;
+        }
+
+        return multiColRows >= 2;
+    }
+
+    private static bool IsProseCalloutBox(BoundingBox box, IReadOnlyList<ParsedTextSpan> textSpans)
+    {
+        var inside = textSpans
+            .Where(s => !string.IsNullOrWhiteSpace(s.Text) &&
+                        s.X + s.Width * 0.5 >= box.X && s.X + s.Width * 0.5 <= box.Right &&
+                        s.Y + s.EffectiveHeight * 0.5 >= box.Y && s.Y + s.EffectiveHeight * 0.5 <= box.Bottom)
+            .ToList();
+
+        if (inside.Any(s => FigureNumberNormalizer.IsNonFigureArtifactCaption(s.Text)))
+            return true;
+
+        int proseLines = inside.Count(s =>
+        {
+            string t = s.Text.Trim();
+            return t.Length >= 20 && t.Contains(' ', StringComparison.Ordinal);
+        });
+        return proseLines >= 3;
     }
 
     // =========================================================================
@@ -2297,9 +2422,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
     [GeneratedRegex(@"/Title\s*\(([^)]*)\)", RegexOptions.Compiled)]
     private static partial Regex TitleRegex();
-
-    [GeneratedRegex(@"^(?:Figure|Fig\.?|Table|Chart|Diagram|Scheme|Plot|Eq\.?|Equation)\s*[0-9IVXA-Za-z.\-]+", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
-    private static partial Regex CaptionRegex();
 
     private static void ReadBalancedParenLiteral(string content, ref int i, StringBuilder sb)
     {

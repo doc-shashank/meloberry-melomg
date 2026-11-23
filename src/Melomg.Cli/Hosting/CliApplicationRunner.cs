@@ -3,7 +3,6 @@ using Melomg.Application;
 using Melomg.Cli.Abstractions;
 using Melomg.Cli.Commands;
 using Melomg.Cli.Parsing;
-using Melomg.Cli.Repl;
 using Melomg.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -14,36 +13,32 @@ public static class CliServiceRegistration
     public static IServiceCollection AddCli(this IServiceCollection services)
     {
         services.AddSingleton<CommandDispatcher>();
-        services.AddSingleton<InteractiveReplLoop>();
 
-        // Documents & Ingestion
+        // Discovery & Metadata
+        RegisterCommand<PrimeCliCommand, PrimeCliCommand.Handler>(services);
+        RegisterCommand<SpecCliCommand, SpecCliCommand.Handler>(services);
+        RegisterCommand<VersionCliCommand, VersionCliCommand.Handler>(services);
+
+        // Documents & Inspection
         RegisterCommand<IngestCliCommand, IngestCliCommand.Handler>(services);
-        RegisterCommand<OpenCliCommand, OpenCliCommand.Handler>(services);
-        RegisterCommand<UseDocCliCommand, UseDocCliCommand.Handler>(services);
-        RegisterCommand<ListDocsCliCommand, ListDocsCliCommand.Handler>(services);
-        RegisterCommand<InfoCliCommand, InfoCliCommand.Handler>(services);
-        RegisterCommand<SetTitleCliCommand, SetTitleCliCommand.Handler>(services);
-        RegisterCommand<ReanalyzeCliCommand, ReanalyzeCliCommand.Handler>(services);
+        RegisterCommand<GetCliCommand, GetCliCommand.Handler>(services);
+        RegisterCommand<LsCliCommand, LsCliCommand.Handler>(services);
 
-        // Figures Inspection, Refinement & Obfuscation Masks
-        RegisterCommand<FiguresCliCommand, FiguresCliCommand.Handler>(services);
-        RegisterCommand<InspectCliCommand, InspectCliCommand.Handler>(services);
-        RegisterCommand<AddFigureCliCommand, AddFigureCliCommand.Handler>(services);
-        RegisterCommand<SetBboxCliCommand, SetBboxCliCommand.Handler>(services);
-        RegisterCommand<SetCaptionCliCommand, SetCaptionCliCommand.Handler>(services);
-        RegisterCommand<SetLabelCliCommand, SetLabelCliCommand.Handler>(services);
-        RegisterCommand<SetCategoryCliCommand, SetCategoryCliCommand.Handler>(services);
-        RegisterCommand<SetIndexCliCommand, SetIndexCliCommand.Handler>(services);
+        // Figures, Masks & Refinement
+        RegisterCommand<PatchCliCommand, PatchCliCommand.Handler>(services);
+        RegisterCommand<AddCliCommand, AddCliCommand.Handler>(services);
         RegisterCommand<MaskCliCommand, MaskCliCommand.Handler>(services);
 
-        // Extraction, Page Rendering, ONNX Model & Runtime, Deletion, Lint & Docs
+        // Extraction, Page Rendering, Batch, Check & Deletion
         RegisterCommand<ExtractCliCommand, ExtractCliCommand.Handler>(services);
         RegisterCommand<RenderCliCommand, RenderCliCommand.Handler>(services);
+        RegisterCommand<BatchCliCommand, BatchCliCommand.Handler>(services);
+        RegisterCommand<RmCliCommand, RmCliCommand.Handler>(services);
+        RegisterCommand<CheckCliCommand, CheckCliCommand.Handler>(services);
+
+        // ONNX Model & Runtime Setup
         RegisterCommand<ModelCliCommand, ModelCliCommand.Handler>(services);
         RegisterCommand<RuntimeCliCommand, RuntimeCliCommand.Handler>(services);
-        RegisterCommand<DeleteCliCommand, DeleteCliCommand.Handler>(services);
-        RegisterCommand<LintCliCommand, LintCliCommand.Handler>(services);
-        RegisterCommand<DocsCliCommand, DocsCliCommand.Handler>(services);
 
         return services;
     }
@@ -67,8 +62,9 @@ public static class CliApplicationRunner
         services.AddApplication();
         services.AddInfrastructure(opts =>
         {
-            if (!string.IsNullOrWhiteSpace(appDataDirectory))
-                opts.AppDataDirectory = Path.GetFullPath(appDataDirectory);
+            var resolved = appDataDirectory ?? CliCommandHelpers.ResolveEnvAppData();
+            if (!string.IsNullOrWhiteSpace(resolved))
+                opts.AppDataDirectory = Path.GetFullPath(resolved);
         });
         services.AddCli();
         return services.BuildServiceProvider();
@@ -80,7 +76,7 @@ public static class CliApplicationRunner
         string? appDataDirectory = null,
         CancellationToken cancellationToken = default)
     {
-        var resolvedAppData = appDataDirectory ?? ExtractAppDataArg(args);
+        var resolvedAppData = appDataDirectory ?? ExtractAppDataArg(args) ?? CliCommandHelpers.ResolveEnvAppData();
         using var provider = BuildServiceProvider(resolvedAppData);
         return await ExecuteWithProviderAsync(args, console, provider, cancellationToken);
     }
@@ -92,20 +88,9 @@ public static class CliApplicationRunner
         CancellationToken cancellationToken = default)
     {
         var filteredArgs = StripAppDataArg(args);
-
-        // Dual Boot Mode 1: Interactive REPL when invoked with no arguments or explicit `repl`
-        if (filteredArgs.Length == 0 ||
-            (filteredArgs.Length == 1 && string.Equals(filteredArgs[0], "repl", StringComparison.OrdinalIgnoreCase)))
-        {
-            var repl = provider.GetRequiredService<InteractiveReplLoop>();
-            return await repl.RunAsync(console, cancellationToken);
-        }
-
-        // Dual Boot Mode 2: Stateless One-Time CLI (supports single command or `->` fluent chain)
         var dispatcher = provider.GetRequiredService<CommandDispatcher>();
-        var stages = CommandTokenizer.SplitArgsIntoChainStages(filteredArgs);
-        var statelessContext = new CliSessionContext();
-        return await dispatcher.ExecuteStagesAsync(stages, console, statelessContext, cancellationToken);
+        var tokens = CommandTokenizer.FromArgs(filteredArgs);
+        return await dispatcher.ExecuteAsync(tokens, console, cancellationToken);
     }
 
     private static string? ExtractAppDataArg(string[] args)

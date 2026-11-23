@@ -45,41 +45,27 @@ public sealed class TestConsole : IConsole
     }
 }
 
-public sealed class CliSessionContext
-{
-    public string? ActiveDocumentId { get; set; }
-    public string? ActiveFigureId { get; set; }
-}
-
 public sealed record GlobalCliOptions(
     bool Silent,
     bool Json,
-    bool Yes,
-    string? DocId,
-    string? FigureId,
-    string? ModelPath,
+    string? OutputDirectory = null,
+    string? ModelPath = null,
     string? AppDataDirectory = null);
 
 public sealed class CliInvocationContext(
     IConsole console,
-    CliSessionContext sessionContext,
     GlobalCliOptions globalOptions,
-    string? targetId,
     IReadOnlyList<string> positionalArgs,
     IReadOnlyDictionary<string, string?> namedOptions,
+    IReadOnlyDictionary<string, IReadOnlyList<string>> multiValueOptions,
     CancellationToken cancellationToken)
 {
     public IConsole Console { get; } = console;
-    public CliSessionContext SessionContext { get; } = sessionContext;
     public GlobalCliOptions GlobalOptions { get; } = globalOptions;
-    public string? TargetId { get; } = targetId;
     public IReadOnlyList<string> PositionalArgs { get; } = positionalArgs;
     public IReadOnlyDictionary<string, string?> NamedOptions { get; } = namedOptions;
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> MultiValueOptions { get; } = multiValueOptions;
     public CancellationToken CancellationToken { get; } = cancellationToken;
-
-    public string? ExplicitTargetId => GlobalOptions.FigureId ?? GlobalOptions.DocId;
-    public string? EffectiveDocumentId => GlobalOptions.DocId ?? SessionContext.ActiveDocumentId;
-    public string? EffectiveFigureId => GlobalOptions.FigureId ?? SessionContext.ActiveFigureId;
 }
 
 public interface ICommandHandler
@@ -89,20 +75,20 @@ public interface ICommandHandler
 
 public enum CommandCategory
 {
+    Discovery,
     Documents,
     Figures,
     Extraction,
     Models,
-    DiagnosticsAndDocs
+    Diagnostics
 }
 
 public sealed record CommandDescriptor(
     string Verb,
     string Usage,
     string Description,
-    bool AcceptsLeadingTargetId,
     Type HandlerType,
-    CommandCategory Category = CommandCategory.DiagnosticsAndDocs,
+    CommandCategory Category = CommandCategory.Diagnostics,
     string? DetailedNotes = null,
     IReadOnlyList<string>? Examples = null);
 
@@ -134,13 +120,15 @@ public static class CliResultExtensions
         if (json)
         {
             var payload = System.Text.Json.JsonSerializer.Serialize(
-                new CliJsonErrorEnvelope(false, new CliJsonErrorBody(error.Code, error.Description, error.Type.ToString())),
-                MelomgCliCompactJsonContext.Default.CliJsonErrorEnvelope);
+                new CliJsonErrorEnvelope(false, new CliJsonErrorBody(error.Code, error.Description, error.Type.ToString(), error.Path, error.Hint)),
+                MelomgCliJsonContext.Default.CliJsonErrorEnvelope);
             console.Error.WriteLine(payload);
         }
         else
         {
             console.Error.WriteLine($"Error [{error.Code}]: {error.Description}");
+            if (!string.IsNullOrWhiteSpace(error.Hint))
+                console.Error.WriteLine($"Hint: {error.Hint}");
         }
 
         return error.Type switch
@@ -153,6 +141,12 @@ public static class CliResultExtensions
         };
     }
 
-    public static int WriteValidationError(IConsole console, string code, string description, bool json = false) =>
-        Result.Failure(new Error(code, description, ErrorType.Validation)).ToExitCode(console, json);
+    public static int WriteValidationError(
+        IConsole console,
+        string code,
+        string description,
+        bool json = false,
+        string? path = null,
+        string? hint = null) =>
+        Result.Failure(new Error(code, description, ErrorType.Validation, path, hint)).ToExitCode(console, json);
 }

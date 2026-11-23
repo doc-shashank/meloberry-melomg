@@ -2,6 +2,7 @@ using Melomg.Domain.Common;
 using Melomg.Domain.Documents;
 using Melomg.Domain.Extraction;
 using Melomg.Domain.Models;
+using Melomg.Infrastructure.Pdf;
 using Xunit;
 
 namespace Melomg.UnitTests;
@@ -41,7 +42,7 @@ public sealed class DomainAndOrderingTests
         Assert.True(doc.AddFigure("Fig_3", 2, FigureCategory.Diagram, box, 0.80, "Cap 3", "Diag 3", DetectionSource.Manual).IsSuccess);
 
         // Insert at index 2 -> shifts Fig_2 and Fig_3 down (n+1)
-        var ins = doc.AddFigure("Fig_4", 2, FigureCategory.Table, box, 0.95, "Table 1", "Table 1", DetectionSource.Manual, targetIndex: 2);
+        var ins = doc.AddFigure("Fig_4", 2, FigureCategory.Chart, box, 0.95, "Chart 1", "Chart 1", DetectionSource.Manual, targetIndex: 2);
         Assert.True(ins.IsSuccess);
         Assert.Equal(["Fig_1", "Fig_4", "Fig_2", "Fig_3"], doc.Figures.Select(f => f.Id).ToArray());
         Assert.Equal([1, 2, 3, 4], doc.Figures.Select(f => f.Index).ToArray());
@@ -214,5 +215,123 @@ public sealed class DomainAndOrderingTests
         // ReDoS adversarial pattern must return cleanly inside timeout without hanging
         var redosPatterns = ExtractionOptions.ParsePatterns("^(a+)+$");
         Assert.False(ExtractionOptions.MatchesAnyPattern(new string('a', 32) + "!", redosPatterns));
+    }
+
+    [Fact]
+    public void DomainCategories_RejectTablesFormulasBoxes_And_NormalizerParsesVocabAndNumbers()
+    {
+        Assert.True(DocumentFigure.TryParseCategory("figure", out var figCat) && figCat == FigureCategory.Figure);
+        Assert.True(DocumentFigure.TryParseCategory("diagram", out var diagCat) && diagCat == FigureCategory.Diagram);
+        Assert.True(DocumentFigure.TryParseCategory("chart", out var chartCat) && chartCat == FigureCategory.Chart);
+
+        Assert.False(DocumentFigure.TryParseCategory("table", out _));
+        Assert.False(DocumentFigure.TryParseCategory("formula", out _));
+        Assert.False(DocumentFigure.TryParseCategory("equation", out _));
+        Assert.False(DocumentFigure.TryParseCategory("box", out _));
+
+        // Valid visual captions & sub-panels
+        Assert.True(FigureNumberNormalizer.TryParseFigureCaption("Fig. 2.1 Cellular injury pathways.", out var p1));
+        Assert.Equal("Fig.", p1.Prefix);
+        Assert.Equal("2.1", p1.Number);
+        Assert.Equal("2.1", p1.NormalizedNumber);
+
+        Assert.True(FigureNumberNormalizer.TryParseFigureCaption("Diagram 1.2(b) Signal transduction", out var p2));
+        Assert.Equal("Diagram", p2.Prefix);
+        Assert.Equal("1.2(b)", p2.Number);
+        Assert.Equal("1.2b", p2.NormalizedNumber);
+
+        // Prose references and non-figure artifacts must be rejected
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("Figure 2.1 shows how ATP depletion occurs.", out _));
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("Table 1.1 Summary of findings", out _));
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("Box 2.1 Clinical features", out _));
+        Assert.True(FigureNumberNormalizer.IsNonFigureArtifactCaption("Table 3.2: Morphologic comparison"));
+        Assert.True(FigureNumberNormalizer.IsNonFigureArtifactCaption("Box 4-1 Key points"));
+
+        Assert.Equal("2.1", FigureNumberNormalizer.NormalizeLookupNumber("Fig. 2.1"));
+        Assert.Equal("2.1", FigureNumberNormalizer.NormalizeLookupNumber("#2.1"));
+        Assert.Equal("2.1a", FigureNumberNormalizer.NormalizeLookupNumber("2.1(a)"));
+        Assert.Equal("2.1", FigureNumberNormalizer.SanitizeForFileName("2.1"));
+
+        var doc = CreateSampleDocument();
+        var box = BoundingBox.Create(40, 40, 200, 150).Value;
+        Assert.True(doc.AddFigure("Fig_1", 1, FigureCategory.Figure, box, 0.9, "Fig. 2.1 Alpha", "Fig. 2.1", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.1").IsSuccess);
+        Assert.True(doc.AddFigure("Fig_2", 2, FigureCategory.Diagram, box, 0.9, "Fig. 2.2 Beta", "Fig. 2.2", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.2").IsSuccess);
+        Assert.Equal("Fig.", doc.Vocabulary.PrimaryPrefix);
+        var found = doc.FindFiguresByNumber("2.1").Matches;
+        Assert.Single(found);
+        Assert.Equal("Fig_1", found[0].Id);
+
+        // Prose/inline figure references with closing parens, colons after parens, or lowercase continuation must be rejected
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("2.15C). Next sentence", out _));
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("Fig. 2.16). Also see panel B", out _));
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("2.22): See detailed inset", out _));
+        Assert.False(FigureNumberNormalizer.TryParseFigureCaption("2.14 sis pathway activation", out _));
+    }
+
+    [Fact]
+    public void FigureSequenceAnalyzer_DetectsGapsDuplicatesOutOfOrderUnnumberedAndLowConfidence()
+    {
+        var doc = CreateSampleDocument(pageCount: 5);
+
+        var box = BoundingBox.Create(40, 40, 200, 150).Value;
+        Assert.True(doc.AddFigure("Fig_1", 1, FigureCategory.Figure, box, 0.91, "Fig. 2.1 First", "Fig. 2.1", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.1").IsSuccess);
+        Assert.True(doc.AddFigure("Fig_2", 2, FigureCategory.Figure, box, 0.89, "Fig. 2.2 Second", "Fig. 2.2", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.2").IsSuccess);
+        // Gap: 2.3 missing, jump to 2.4
+        Assert.True(doc.AddFigure("Fig_3", 3, FigureCategory.Figure, box, 0.88, "Fig. 2.4 Fourth", "Fig. 2.4", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.4").IsSuccess);
+        // Duplicate 2.2
+        Assert.True(doc.AddFigure("Fig_4", 4, FigureCategory.Figure, box, 0.87, "Fig. 2.2 Dup", "Fig. 2.2", DetectionSource.Hybrid, vocabPrefix: "Fig.", figureNumber: "2.2").IsSuccess);
+        // Unnumbered & low confidence
+        Assert.True(doc.AddFigure("Fig_5", 5, FigureCategory.Figure, box, 0.41, null, "Untagged", DetectionSource.Hybrid).IsSuccess);
+
+        var report = FigureSequenceAnalyzer.Analyze(doc, lowConfidenceThreshold: 0.55);
+
+        Assert.Contains(report.Anomalies, a => a.Code == "Anomaly.SequenceGap" && a.ExpectedNumber == "2.3");
+        Assert.Contains(report.Anomalies, a => a.Code == "Anomaly.DuplicateNumber" && a.Message.Contains("2.2", StringComparison.Ordinal));
+        Assert.Contains(report.Anomalies, a => a.Code == "Anomaly.OutOfOrderNumber");
+        Assert.Contains(report.Anomalies, a => a.Code == "Anomaly.UnnumberedFigure" && (a.FigureIds?.Contains("Fig_5") ?? false));
+        Assert.Contains(report.Anomalies, a => a.Code == "Anomaly.LowConfidence" && (a.FigureIds?.Contains("Fig_5") ?? false));
+        Assert.Contains(2, report.SuspectPages);
+        Assert.Contains(3, report.SuspectPages);
+        Assert.Contains(4, report.SuspectPages);
+        Assert.Contains(5, report.SuspectPages);
+    }
+
+    [Fact]
+    public void AssignCaptionsToPageFigures_HandlesSideColumnExclusivePairingAndMultiPanelFusion()
+    {
+        // 1. Exclusive 1-to-1 + side-column pairing (no duplicate stealing)
+        var regions = new List<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source)>
+        {
+            (BoundingBox.Create(60, 100, 200, 140).Value, 0.90, FigureCategory.Figure, DetectionSource.Hybrid),
+            (BoundingBox.Create(60, 320, 200, 140).Value, 0.88, FigureCategory.Figure, DetectionSource.Hybrid)
+        };
+        var spans = new List<ParsedTextSpan>
+        {
+            // Side-column caption to the right of figure 1
+            new(275, 190, 160, 10, "Fig. 2.5 Necrosis morphology"),
+            // Caption below figure 2
+            new(60, 470, 200, 10, "Fig. 2.6 Apoptosis cascade")
+        };
+
+        var assigned = HybridOnnxPdfIngestionEngine.AssignCaptionsToPageFigures(regions, spans, 612, 792, "Fig.");
+        Assert.Equal(2, assigned.Count);
+        Assert.Equal("2.5", assigned[0].Anchor?.Parsed.NormalizedNumber);
+        Assert.Equal("2.6", assigned[1].Anchor?.Parsed.NormalizedNumber);
+
+        // 2. Multi-panel fusion: two side-by-side panels under a single spanning caption
+        var multiRegions = new List<(BoundingBox Box, double Confidence, FigureCategory Category, DetectionSource Source)>
+        {
+            (BoundingBox.Create(60, 120, 140, 120).Value, 0.86, FigureCategory.Figure, DetectionSource.Hybrid),
+            (BoundingBox.Create(220, 120, 140, 120).Value, 0.84, FigureCategory.Figure, DetectionSource.Hybrid)
+        };
+        var multiSpans = new List<ParsedTextSpan>
+        {
+            new(65, 250, 290, 10, "Fig. 2.12 Dual panel ultrastructure")
+        };
+
+        var fused = HybridOnnxPdfIngestionEngine.AssignCaptionsToPageFigures(multiRegions, multiSpans, 612, 792, "Fig.");
+        Assert.Single(fused);
+        Assert.Equal("2.12", fused[0].Anchor?.Parsed.NormalizedNumber);
+        Assert.True(fused[0].Box.Width >= 290);
     }
 }

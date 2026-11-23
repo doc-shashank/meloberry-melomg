@@ -7,6 +7,13 @@ namespace Melomg.Cli.Abstractions;
 
 internal static class CliCommandHelpers
 {
+    public static bool IsAgentEnvironmentEnabled() =>
+        string.Equals(Environment.GetEnvironmentVariable("MELOMG_AGENT"), "1", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(Environment.GetEnvironmentVariable("MBY_AGENT"), "1", StringComparison.OrdinalIgnoreCase);
+
+    public static string? ResolveEnvAppData() =>
+        Environment.GetEnvironmentVariable("MELOMG_APP_DATA")
+        ?? Environment.GetEnvironmentVariable("MELOMG_APPDATA");
 
     public static bool TryParseReorderMode(string raw, out ReorderMode mode)
     {
@@ -22,6 +29,26 @@ internal static class CliCommandHelpers
                 mode = default;
                 return false;
         }
+    }
+
+    public static bool TryParseMoveSpec(string raw, out int index, out ReorderMode mode)
+    {
+        index = 0;
+        mode = ReorderMode.Shift;
+        if (string.IsNullOrWhiteSpace(raw))
+            return false;
+
+        var parts = raw.Split(':', StringSplitOptions.TrimEntries);
+        if (parts.Length is < 1 or > 2)
+            return false;
+
+        if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out index))
+            return false;
+
+        if (parts.Length == 2)
+            return TryParseReorderMode(parts[1], out mode);
+
+        return true;
     }
 
     public static bool TryGetDoubleOption(
@@ -100,62 +127,6 @@ internal static class CliCommandHelpers
         return true;
     }
 
-    public static bool TryResolveDocumentId(
-        CliInvocationContext ctx,
-        bool allowPositional,
-        string usage,
-        out string docId,
-        out int errorCode)
-    {
-        if (allowPositional && ctx.PositionalArgs.Count > (ctx.TargetId is not null ? 0 : 1))
-        {
-            docId = string.Empty;
-            errorCode = CliResultExtensions.WriteValidationError(ctx.Console, "Cli.InvalidArgs", $"Usage: {usage}", ctx.GlobalOptions.Json);
-            return false;
-        }
-
-        var resolved = ctx.TargetId
-            ?? (allowPositional && ctx.PositionalArgs.Count == 1 ? ctx.PositionalArgs[0] : ctx.EffectiveDocumentId);
-        if (string.IsNullOrWhiteSpace(resolved))
-        {
-            docId = string.Empty;
-            errorCode = CliResultExtensions.WriteValidationError(ctx.Console, "Cli.MissingDocument", "No document workspace targeted. Pass <docID> or '--doc <docID>'.", ctx.GlobalOptions.Json);
-            return false;
-        }
-
-        docId = resolved;
-        errorCode = ExitCodes.Success;
-        return true;
-    }
-
-    public static bool TryResolveFigureId(
-        CliInvocationContext ctx,
-        bool allowPositional,
-        string usage,
-        out string figId,
-        out int errorCode)
-    {
-        if (allowPositional && ctx.PositionalArgs.Count > (ctx.TargetId is not null ? 0 : 1))
-        {
-            figId = string.Empty;
-            errorCode = CliResultExtensions.WriteValidationError(ctx.Console, "Cli.InvalidArgs", $"Usage: {usage}", ctx.GlobalOptions.Json);
-            return false;
-        }
-
-        var resolved = ctx.TargetId
-            ?? (allowPositional && ctx.PositionalArgs.Count == 1 ? ctx.PositionalArgs[0] : ctx.EffectiveFigureId);
-        if (string.IsNullOrWhiteSpace(resolved))
-        {
-            figId = string.Empty;
-            errorCode = CliResultExtensions.WriteValidationError(ctx.Console, "Cli.MissingFigure", "No figure targeted. Pass <figID> or '--figure <figID>'.", ctx.GlobalOptions.Json);
-            return false;
-        }
-
-        figId = resolved;
-        errorCode = ExitCodes.Success;
-        return true;
-    }
-
     public static bool TryParseDoubles(IReadOnlyList<string> args, int startIndex, Span<double> values)
     {
         if (args.Count < startIndex + values.Length) return false;
@@ -165,15 +136,21 @@ internal static class CliCommandHelpers
         return true;
     }
 
-    public static bool ConfirmDeletion(CliInvocationContext ctx)
+    public static async Task<Result<string>> ReadFileOrStdinAsync(string fileOrDash, IConsole console, CancellationToken cancellationToken)
     {
-        if (ctx.GlobalOptions.Yes) return true;
-        var promptWriter = ctx.GlobalOptions.Json ? ctx.Console.Error : ctx.Console.Out;
-        promptWriter.Write("Confirm deletion? [y/N]: ");
-        promptWriter.Flush();
-        var answer = ctx.Console.In.ReadLine()?.Trim();
-        return string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(answer, "yes", StringComparison.OrdinalIgnoreCase);
+        if (string.Equals(fileOrDash, "-", StringComparison.Ordinal))
+        {
+            string text = await console.In.ReadToEndAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(text))
+                return new Error("Json.EmptyInput", "No JSON input received on stdin.", ErrorType.Validation);
+            return text;
+        }
+
+        string fullPath = Path.GetFullPath(fileOrDash);
+        if (!File.Exists(fullPath))
+            return new Error("File.NotFound", $"Input JSON file '{fullPath}' was not found.", ErrorType.NotFound);
+
+        return await File.ReadAllTextAsync(fullPath, cancellationToken);
     }
 
     public static int Finish<T>(
