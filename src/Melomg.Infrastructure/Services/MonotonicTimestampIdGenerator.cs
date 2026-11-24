@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Melomg.Application.Abstractions;
 
 namespace Melomg.Infrastructure.Services;
@@ -34,40 +36,58 @@ public sealed class MonotonicTimestampIdGenerator(MelomgStorageOptions? options 
         var dir = Path.GetDirectoryName(clockFilePath);
         if (!string.IsNullOrWhiteSpace(dir)) Directory.CreateDirectory(dir);
 
-        const int maxAttempts = 50;
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        string keyHash = Convert.ToHexStringLower(
+            SHA256.HashData(Encoding.UTF8.GetBytes(Path.GetFullPath(clockFilePath).ToUpperInvariant())));
+        using var mutex = new Mutex(initiallyOwned: false, name: $@"Local\MelomgIdClock_{keyHash[..24]}");
+
+        bool acquired = false;
+        try
         {
-            try
+            try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(10)); }
+            catch (AbandonedMutexException) { acquired = true; }
+
+            if (!acquired)
+                throw new IOException($"Timed out waiting for cross-process ID clock mutex for '{clockFilePath}'.");
+
+            const int maxAttempts = 20;
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                using var fs = new FileStream(clockFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-                long persistedMs = 0;
-                if (fs.Length > 0)
+                try
                 {
-                    using var reader = new StreamReader(fs, leaveOpen: true);
-                    long.TryParse(reader.ReadToEnd().Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out persistedMs);
+                    using var fs = new FileStream(clockFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                    long persistedMs = 0;
+                    if (fs.Length > 0)
+                    {
+                        using var reader = new StreamReader(fs, leaveOpen: true);
+                        long.TryParse(reader.ReadToEnd().Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out persistedMs);
+                    }
+
+                    long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    long floorMs = Math.Max(_lastEpochMs, persistedMs);
+                    long nextMs = nowMs <= floorMs ? floorMs + 1 : nowMs;
+
+                    fs.Position = 0;
+                    fs.SetLength(0);
+                    using (var writer = new StreamWriter(fs, leaveOpen: true))
+                    {
+                        writer.Write(nextMs.ToString(CultureInfo.InvariantCulture));
+                        writer.Flush();
+                    }
+                    fs.Flush(flushToDisk: true);
+
+                    return _lastEpochMs = nextMs;
                 }
-
-                long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                long floorMs = Math.Max(_lastEpochMs, persistedMs);
-                long nextMs = nowMs <= floorMs ? floorMs + 1 : nowMs;
-
-                fs.Position = 0;
-                fs.SetLength(0);
-                using (var writer = new StreamWriter(fs, leaveOpen: true))
+                catch (IOException) when (attempt < maxAttempts - 1)
                 {
-                    writer.Write(nextMs.ToString(CultureInfo.InvariantCulture));
-                    writer.Flush();
+                    Thread.Sleep(Math.Min(100, 5 * (attempt + 1)));
                 }
-                fs.Flush(flushToDisk: true);
+            }
 
-                return _lastEpochMs = nextMs;
-            }
-            catch (IOException) when (attempt < maxAttempts - 1)
-            {
-                Thread.Sleep(1);
-            }
+            throw new IOException($"Unable to acquire exclusive file lock on ID clock '{clockFilePath}'.");
         }
-
-        return NextInMemoryMs();
+        finally
+        {
+            if (acquired) mutex.ReleaseMutex();
+        }
     }
 }

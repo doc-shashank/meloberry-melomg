@@ -21,7 +21,11 @@ public sealed class IngestCliCommand : CliCommand
                 "melomg ingest ./paper.pdf --project -o ./study",
                 "melomg ingest Doc_2026... --refresh --confidence 0.45",
                 "melomg ingest ./paper.pdf --quiet --json"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "project", "refresh", "confidence", "title", "offline", "retain-db", "quiet", "verbose"
+            }))
     {
     }
 
@@ -102,7 +106,11 @@ public sealed class GetCliCommand : CliCommand
                 "melomg get Doc_2026...",
                 "melomg get Doc_2026...#2.1 --view full",
                 "melomg get Doc_2026... --view ids --page 2"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "view", "page", "category", "min-conf"
+            }))
     {
     }
 
@@ -197,7 +205,8 @@ public sealed class LsCliCommand : CliCommand
             Description: "Lists discovered Doc_<d/t> workspaces and their detected figure vocabulary.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Documents,
-            Examples: ["melomg ls", "melomg ls ./work --json"]))
+            Examples: ["melomg ls", "melomg ls ./work --json"],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 

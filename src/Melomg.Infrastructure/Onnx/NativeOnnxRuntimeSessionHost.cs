@@ -33,7 +33,7 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
     private readonly object _sessionCacheGate = new();
     private readonly ReaderWriterLockSlim _inferenceLock = new(LockRecursionPolicy.NoRecursion);
     private readonly ConcurrentDictionary<string, CachedSessionEntry> _sessions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<nint> _auxiliaryHandles = [];
+    private readonly ConcurrentBag<nint> _auxiliaryHandles = [];
 
     private volatile NativeLoadSnapshot? _nativeSnapshot;
     private string? _loadedVersionDir;
@@ -222,22 +222,20 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
         {
             try
             {
-                var dmlOptions = new SessionOptions
+                using var dmlOptions = new SessionOptions
                 {
                     EnableMemoryPattern = false,
                     ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                     LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR
                 };
                 dmlOptions.AppendExecutionProvider_DML(0);
-                try { return (new InferenceSession(modelPath, dmlOptions), "onnxruntime-directml"); }
-                catch { dmlOptions.Dispose(); throw; }
+                return (new InferenceSession(modelPath, dmlOptions), "onnxruntime-directml");
             }
             catch { }
         }
 
-        var cpuOptions = new SessionOptions { LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR };
-        try { return (new InferenceSession(modelPath, cpuOptions), "onnxruntime-cpu"); }
-        catch { cpuOptions.Dispose(); throw; }
+        using var cpuOptions = new SessionOptions { LogSeverityLevel = OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR };
+        return (new InferenceSession(modelPath, cpuOptions), "onnxruntime-cpu");
     }
 
     private static IReadOnlyList<string>? ExtractClassesFromModelMetadata(IDictionary<string, string>? customMeta)
@@ -265,15 +263,27 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
 
     internal static IReadOnlyList<string>? ParsePythonDictClassNames(string rawNames)
     {
-        var list = new SortedDictionary<int, string>();
+        var map = new Dictionary<int, string>();
+        int maxIdx = -1;
         foreach (var part in rawNames.Trim('{', '}', ' ').Split(','))
         {
             int colon = part.IndexOf(':');
-            if (colon <= 0 || !int.TryParse(part[..colon].Trim(), out int idx)) continue;
+            if (colon <= 0) continue;
+            string keyToken = part[..colon].Trim().Trim('\'', '"', ' ');
+            if (!int.TryParse(keyToken, out int idx) || idx < 0) continue;
             string val = part[(colon + 1)..].Trim().Trim('\'', '"', ' ');
-            if (!string.IsNullOrWhiteSpace(val)) list[idx] = val;
+            if (!string.IsNullOrWhiteSpace(val))
+            {
+                map[idx] = val;
+                if (idx > maxIdx) maxIdx = idx;
+            }
         }
-        return list.Count > 0 ? [.. list.Values] : null;
+        if (map.Count == 0 || maxIdx > 4096) return null;
+
+        var result = new string[maxIdx + 1];
+        Array.Fill(result, string.Empty);
+        foreach (var (k, v) in map) result[k] = v;
+        return result;
     }
 
     private void UnloadHandlesLocked()
@@ -288,9 +298,8 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
                     if (_sessions.TryRemove(key, out var entry)) entry.Session.Dispose();
             }
 
-            foreach (var aux in _auxiliaryHandles)
+            while (_auxiliaryHandles.TryTake(out nint aux))
                 if (aux != 0) { try { NativeLibrary.Free(aux); } catch { } }
-            _auxiliaryHandles.Clear();
 
             FreeHandle(ref _onnxRuntimeHandle);
             FreeHandle(ref _providersSharedHandle);
@@ -316,8 +325,9 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
         static void FreeHandle(ref nint handle)
         {
             if (handle == 0) return;
-            NativeLibrary.Free(handle);
+            nint toFree = handle;
             handle = 0;
+            try { NativeLibrary.Free(toFree); } catch { }
         }
     }
 
@@ -350,7 +360,7 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
 
         if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out nint depHandle))
         {
-            lock (host._hostGate) host._auxiliaryHandles.Add(depHandle);
+            host._auxiliaryHandles.Add(depHandle);
             return depHandle;
         }
         return 0;
@@ -506,7 +516,8 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
 
         var normBox = new BoundingBox(nx1, ny1, nw, nh);
         var labels = customClasses is { Count: > 0 } ? customClasses : DocStructBenchClasses;
-        string rawLabel = classId >= 0 && classId < labels.Count ? labels[classId] : "figure";
+        if (classId < 0 || classId >= labels.Count) return;
+        string rawLabel = labels[classId];
         string lower = rawLabel.Trim().ToLowerInvariant();
 
         if (lower is "figure_caption" or "picture_caption" or "image_caption" or "diagram_caption" or "chart_caption" or "caption")

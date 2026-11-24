@@ -6,7 +6,8 @@ Stateless, AI-agent-first PDF image/diagram crop extractor complementing the Mel
 
 - **Images & Diagrams Only**: Supports ONLY `figure`, `diagram`, and `chart`. Tables, borderless `booktabs` tables, formulas, and shaded/bordered callout boxes cannot be represented, stored, or extracted.
 - **Crop-Only Extraction**: Never dumps raw embedded `/Image` streams; always raster-renders PDF page regions via `Windows.Data.Pdf` with configurable `--quality` and `--dpi`.
-- **Stateless & Non-Interactive**: Bare `melomg` prints the `prime` grammar card and exits `0`. `rm` and `runtime uninstall` execute immediately without prompts.
+- **Stateless, Non-Interactive & Safe**: Bare `melomg` prints the `prime` grammar card and exits `0`. `rm` removes only melomg workspace artifacts (`Doc_*.db`, WAL/SHM sidecars, `.qa_overlays`, generated `page_*` / `fig_*` / `Fig_*` / `manifest.json` files, and empty directories) and never deletes source PDFs or unrelated user files.
+- **Strict JSON & CLI Contracts**: `--json` keeps `stdout` strictly for valid success envelopes (`{"success":true,"data":...}`)—including `<cmd> --help --json`—and routes all errors (including failed `check --json` with `error.details`) to `stderr` (`{"success":false,"error":...}`). Cross-command flags, unknown single-dash flags, and wrong-typed `batch` JSON fields fail fast with exit `2`.
 
 ## Docs
 
@@ -41,4 +42,4 @@ Stateless, AI-agent-first PDF image/diagram crop extractor complementing the Mel
 
 ## Exit Codes
 
-`0` Success | `1` General/IO Error | `2` Validation/JSON/Lint Error | `3` Not Found | `4` Conflict (`Figure.AmbiguousNumber`, `Project.PdfConflict`) | `5` Unauthorized
+`0` Success | `1` General/IO Error | `2` Validation/JSON/Lint Error | `3` Not Found | `4` Conflict (`Figure.AmbiguousNumber`, `Project.AlreadyExists`, `Project.PdfConflict`) | `5` Unauthorized

@@ -15,7 +15,8 @@ internal sealed record CliJsonErrorBody(
     string Description,
     string Type,
     string? Path = null,
-    string? Hint = null);
+    string? Hint = null,
+    LintReportResponse? Details = null);
 
 internal sealed record CliJsonErrorEnvelope(bool Success, CliJsonErrorBody Error);
 
@@ -30,6 +31,13 @@ internal sealed record SpecResponse(
     IReadOnlyList<SpecEntryPayload>? Specs = null);
 
 internal sealed record VersionPayload(string Tool, string Version, string Runtime, string Os);
+
+internal sealed record CommandHelpPayload(
+    string Verb,
+    string Usage,
+    string Description,
+    string? DetailedNotes = null,
+    IReadOnlyList<string>? Examples = null);
 
 internal sealed record BatchOpResultItem(int Index, string Op, string? Id, bool Success);
 
@@ -65,6 +73,7 @@ internal sealed record AddFigureJsonInput(
 [JsonSerializable(typeof(CliJsonEnvelope<PrimePayload>))]
 [JsonSerializable(typeof(CliJsonEnvelope<SpecResponse>))]
 [JsonSerializable(typeof(CliJsonEnvelope<VersionPayload>))]
+[JsonSerializable(typeof(CliJsonEnvelope<CommandHelpPayload>))]
 [JsonSerializable(typeof(CliJsonEnvelope<IngestPdfResponse>))]
 [JsonSerializable(typeof(CliJsonEnvelope<IReadOnlyList<DocumentListItem>>))]
 [JsonSerializable(typeof(CliJsonEnvelope<GetTargetResponse>))]

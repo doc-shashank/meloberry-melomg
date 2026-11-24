@@ -27,6 +27,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await using (var conn = OpenWorkspaceConnection(dbPath))
         {
             await conn.OpenAsync(cancellationToken);
+            await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: true);
             await EnsureWorkspaceSchemaAsync(conn, cancellationToken);
 
             await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
@@ -150,6 +151,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await using (var conn = registry.OpenSettingsConnection())
         {
             await conn.OpenAsync(cancellationToken);
+            await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText =
                 """
@@ -231,20 +233,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
 
         if (!Directory.Exists(lookup.StorageDirectory)) return;
 
-        string leafName = Path.GetFileName(lookup.StorageDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-        bool isDedicatedWorkspaceDir =
-            string.Equals(leafName, documentId, StringComparison.OrdinalIgnoreCase) ||
-            leafName.StartsWith("Doc_", StringComparison.OrdinalIgnoreCase) ||
-            leafName.StartsWith("project_", StringComparison.OrdinalIgnoreCase);
-
-        if (isDedicatedWorkspaceDir)
-        {
-            Directory.Delete(lookup.StorageDirectory, recursive: true);
-        }
-        else
-        {
-            TryCleanupWorkspaceArtifacts(lookup.StorageDirectory, lookup.DatabasePath);
-        }
+        TryCleanupWorkspaceArtifacts(lookup.StorageDirectory, lookup.DatabasePath, removeGeneratedImages: true);
     }
 
     public async Task DiscardWorkspaceDatabaseAsync(string documentId, CancellationToken cancellationToken = default)
@@ -254,21 +243,57 @@ public sealed class SqliteDocumentWorkspaceRepository(
         if (lookup is null) return;
 
         SqliteConnection.ClearAllPools();
-        TryCleanupWorkspaceArtifacts(lookup.StorageDirectory, lookup.DatabasePath);
+        TryCleanupWorkspaceArtifacts(lookup.StorageDirectory, lookup.DatabasePath, removeGeneratedImages: false);
     }
 
-    private static void TryCleanupWorkspaceArtifacts(string storageDirectory, string databasePath)
+    private static void TryCleanupWorkspaceArtifacts(string storageDirectory, string databasePath, bool removeGeneratedImages)
     {
         try
         {
             if (File.Exists(databasePath)) File.Delete(databasePath);
+            foreach (var suffix in new[] { "-wal", "-shm" })
+            {
+                string sidecar = databasePath + suffix;
+                if (File.Exists(sidecar)) File.Delete(sidecar);
+            }
+
             var qaManifest = Path.Combine(storageDirectory, ".qa_overlays");
             if (File.Exists(qaManifest)) File.Delete(qaManifest);
 
-            var figuresDir = Path.Combine(storageDirectory, "figures");
-            if (Directory.Exists(figuresDir) && !Directory.EnumerateFileSystemEntries(figuresDir).Any())
-                Directory.Delete(figuresDir, recursive: false);
+            foreach (var subName in new[] { "pages", "qa_overlay" })
+            {
+                string subDir = Path.Combine(storageDirectory, subName);
+                if (!Directory.Exists(subDir)) continue;
+                if (removeGeneratedImages)
+                {
+                    foreach (var f in Directory.EnumerateFiles(subDir, "page_*.*"))
+                        File.Delete(f);
+                }
+                if (!Directory.EnumerateFileSystemEntries(subDir).Any())
+                    Directory.Delete(subDir, recursive: false);
+            }
 
+            var figuresDir = Path.Combine(storageDirectory, "figures");
+            if (Directory.Exists(figuresDir))
+            {
+                if (removeGeneratedImages)
+                {
+                    foreach (var f in Directory.EnumerateFiles(figuresDir))
+                    {
+                        string name = Path.GetFileName(f);
+                        if (name.StartsWith("fig_", StringComparison.OrdinalIgnoreCase) ||
+                            name.StartsWith("Fig_", StringComparison.Ordinal) ||
+                            string.Equals(name, "manifest.json", StringComparison.OrdinalIgnoreCase))
+                        {
+                            File.Delete(f);
+                        }
+                    }
+                }
+                if (!Directory.EnumerateFileSystemEntries(figuresDir).Any())
+                    Directory.Delete(figuresDir, recursive: false);
+            }
+
+            // Delete containing folder ONLY if completely empty — never deletes user PDFs or unrelated files.
             if (Directory.Exists(storageDirectory) && !Directory.EnumerateFileSystemEntries(storageDirectory).Any())
                 Directory.Delete(storageDirectory, recursive: false);
         }
@@ -280,6 +305,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await registry.EnsureInitializedAsync(cancellationToken);
         await using var conn = registry.OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: true);
         await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
 
         await SqliteModelSettingsRepository.ExecuteNonQueryAsync(
@@ -307,6 +333,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
     {
         await using var conn = registry.OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT DocumentId FROM FigureEntityIndex WHERE FigureId = $figId;";
         cmd.Parameters.AddWithValue("$figId", figureId);
@@ -329,6 +356,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
     {
         await using var conn = registry.OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT DocumentId, DbPath, StorageDirectory FROM DocumentRegistry WHERE DocumentId = $docId;";
         cmd.Parameters.AddWithValue("$docId", documentId);
@@ -348,6 +376,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await using (var conn = registry.OpenSettingsConnection())
         {
             await conn.OpenAsync(cancellationToken);
+            await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT DbPath FROM DocumentRegistry;";
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -355,9 +384,15 @@ public sealed class SqliteDocumentWorkspaceRepository(
                 registeredDbPaths.Add(Path.GetFullPath(reader.GetString(0)));
         }
 
+        var enumOpts = new EnumerationOptions { IgnoreInaccessible = true, ReturnSpecialDirectories = false };
+
         async Task TryRegisterDirAsync(string dir)
         {
-            foreach (var candidateDb in Directory.EnumerateFiles(dir, "Doc_*.db"))
+            IEnumerable<string> dbFiles;
+            try { dbFiles = Directory.EnumerateFiles(dir, "Doc_*.db", enumOpts); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
+
+            foreach (var candidateDb in dbFiles)
             {
                 if (registeredDbPaths.Contains(Path.GetFullPath(candidateDb))) continue;
                 var doc = await LoadDocumentAsync(candidateDb, dir, cancellationToken);
@@ -365,17 +400,22 @@ public sealed class SqliteDocumentWorkspaceRepository(
             }
         }
 
-        await TryRegisterDirAsync(rootDir);
-        foreach (var subDir in Directory.EnumerateDirectories(rootDir))
-            await TryRegisterDirAsync(subDir);
+        async Task ScanOneLevelAsync(string baseDir)
+        {
+            await TryRegisterDirAsync(baseDir);
+            IEnumerable<string> subDirs;
+            try { subDirs = Directory.EnumerateDirectories(baseDir, "*", enumOpts); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
+
+            foreach (var subDir in subDirs)
+                await TryRegisterDirAsync(subDir);
+        }
+
+        await ScanOneLevelAsync(rootDir);
 
         string meloberryMelomgRoot = Path.Combine(rootDir, ".meloberry", "melomg");
         if (Directory.Exists(meloberryMelomgRoot))
-        {
-            await TryRegisterDirAsync(meloberryMelomgRoot);
-            foreach (var subDir in Directory.EnumerateDirectories(meloberryMelomgRoot))
-                await TryRegisterDirAsync(subDir);
-        }
+            await ScanOneLevelAsync(meloberryMelomgRoot);
     }
 
     private async Task RegisterDocumentAsync(PdfDocument document, string dbPath, CancellationToken cancellationToken)
@@ -383,6 +423,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         await registry.EnsureInitializedAsync(cancellationToken);
         await using var conn = registry.OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: true);
         await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(cancellationToken);
 
         await SqliteModelSettingsRepository.ExecuteNonQueryAsync(
@@ -428,6 +469,7 @@ public sealed class SqliteDocumentWorkspaceRepository(
         {
             await using var conn = OpenWorkspaceConnection(dbPath);
             await conn.OpenAsync(cancellationToken);
+            await SqliteModelSettingsRepository.ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
 
             await using (var checkCmd = conn.CreateCommand())
             {
@@ -568,7 +610,8 @@ public sealed class SqliteDocumentWorkspaceRepository(
             ingestedAt, activeFigId, pages, figures, workspaceMode, retainDatabase, scannedVocabPrefixes);
     }
 
-    private static SqliteConnection OpenWorkspaceConnection(string dbPath) => new($"Data Source={dbPath};Pooling=False");
+    private static SqliteConnection OpenWorkspaceConnection(string dbPath) =>
+        new($"Data Source={dbPath};Pooling=False;Default Timeout=5");
 
     private static async Task EnsureColumnsAsyncCompat(SqliteConnection conn, CancellationToken cancellationToken)
     {

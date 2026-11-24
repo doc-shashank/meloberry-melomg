@@ -188,8 +188,11 @@ public sealed class IngestPdfHandler(
 
         string target = command.TargetPath.Trim();
 
-        // 1. Refresh existing workspace by Doc_* ID
-        if (target.StartsWith("Doc_", StringComparison.Ordinal))
+        // 1. Refresh existing workspace by Doc_* ID (only when not an existing file or directory on disk)
+        if (!workingDirectoryProvider.FileExists(target) &&
+            !workingDirectoryProvider.DirectoryExists(target) &&
+            AddressResolver.LooksLikeEntityIdAddress(target) &&
+            target.StartsWith("Doc_", StringComparison.Ordinal))
         {
             var lookup = await repository.FindDocumentAsync(target, cancellationToken);
             if (lookup is null) return DocumentErrors.NotFound(target);
@@ -230,9 +233,6 @@ public sealed class IngestPdfHandler(
             : workingDirectoryProvider.NormalizeDirectoryPath(command.OutputDirectory);
         var workspaceDir = Path.Combine(baseWorkspaceRoot, docId);
 
-        var workspaceInit = await pdfEngine.InitializeWorkspaceAsync(workspaceDir, cancellationToken);
-        if (!workspaceInit.IsSuccess) return workspaceInit.Error!;
-
         var resolvedTitle = string.IsNullOrWhiteSpace(command.Title) ? analysis.SuggestedTitle : command.Title.Trim();
         var docResult = PdfDocument.Create(
             docId, resolvedTitle, fullTarget, fullTarget, analysis.Sha256Hash, workspaceDir,
@@ -244,7 +244,28 @@ public sealed class IngestPdfHandler(
         var popRes = ModelResolutionHelper.PopulateFigures(document, analysis.Candidates, idGenerator);
         if (!popRes.IsSuccess) return popRes.Error!;
 
-        await repository.CreateDocumentAsync(document, cancellationToken);
+        bool workspaceExisted = workingDirectoryProvider.DirectoryExists(workspaceDir);
+        bool persisted = false;
+        try
+        {
+            var workspaceInit = await pdfEngine.InitializeWorkspaceAsync(workspaceDir, cancellationToken);
+            if (!workspaceInit.IsSuccess) return workspaceInit.Error!;
+
+            await repository.CreateDocumentAsync(document, cancellationToken);
+            persisted = true;
+        }
+        finally
+        {
+            if (!persisted && !workspaceExisted)
+            {
+                try
+                {
+                    if (Directory.Exists(workspaceDir))
+                        Directory.Delete(workspaceDir, recursive: true);
+                }
+                catch { }
+            }
+        }
 
         return BuildIngestResponse(
             document, document.WorkingDirectory, Path.Combine(document.WorkingDirectory, $"{document.Id}.db"),
@@ -296,6 +317,16 @@ public sealed class IngestPdfHandler(
         string projectDir = !string.IsNullOrWhiteSpace(command.OutputDirectory)
             ? workingDirectoryProvider.NormalizeDirectoryPath(command.OutputDirectory)
             : Path.Combine(workingDirectoryProvider.GetCurrentDirectory(), $"project_{SanitizeProjectFolderSegment(Path.GetFileNameWithoutExtension(fullPdfPath))}");
+
+        var existingProject = await repository.FindDocumentInDirectoryAsync(projectDir, cancellationToken);
+        if (existingProject is not null)
+        {
+            return new Error(
+                "Project.AlreadyExists",
+                $"Project directory '{projectDir}' already contains workspace '{existingProject.Document.Id}'.",
+                ErrorType.Conflict,
+                Hint: $"Reopen or refresh with 'melomg ingest \"{projectDir}\"' or choose a different -o directory.");
+        }
 
         string expectedDestPdf = Path.Combine(projectDir, Path.GetFileName(fullPdfPath));
         if (!string.Equals(fullPdfPath, expectedDestPdf, StringComparison.OrdinalIgnoreCase) &&
@@ -373,6 +404,8 @@ public sealed class IngestPdfHandler(
         if (!analysisResult.IsSuccess) return analysisResult.Error!;
 
         var analysis = analysisResult.Value;
+        var snapRes = doc.RefreshDocumentSnapshot(analysis.Sha256Hash, analysis.Pages, TimeProvider.System.GetUtcNow());
+        if (!snapRes.IsSuccess) return snapRes.Error!;
         int previousCount = doc.Figures.Count;
         var createdFigures = new List<DocumentFigure>(analysis.Candidates.Count);
 
@@ -466,6 +499,16 @@ public sealed class GetTargetHandler(AddressResolver resolver, IFigureLabelDetec
         var doc = resolved.DocumentContext.Document;
         string viewStr = query.View.ToString().ToLowerInvariant();
 
+        if (resolved.Address.Kind is AddressKind.FigureId or AddressKind.FigureIndex or AddressKind.FigureNumber &&
+            resolved.Figures.Count == 1 &&
+            (query.PageNumber.HasValue || !string.IsNullOrWhiteSpace(query.Category) || query.MinConfidence.HasValue))
+        {
+            return new Error(
+                "Cli.InvalidArgs",
+                "List filters (--page, --category, --min-conf) cannot be used when targeting a single figure.",
+                ErrorType.Validation);
+        }
+
         // Single figure target (<figId> or <docId>#<num|fN>)
         if (resolved.Address.Kind is AddressKind.FigureId or AddressKind.FigureIndex or AddressKind.FigureNumber &&
             resolved.Figures.Count == 1)
@@ -514,7 +557,8 @@ public sealed class GetTargetHandler(AddressResolver resolver, IFigureLabelDetec
         if (query.PageNumber.HasValue && doc.GetPage(query.PageNumber.Value) is null)
             return DocumentErrors.InvalidPageNumber(query.PageNumber.Value, doc.PageCount);
 
-        if (query.MinConfidence.HasValue && (query.MinConfidence.Value < 0 || query.MinConfidence.Value > 1))
+        if (query.MinConfidence.HasValue &&
+            (!double.IsFinite(query.MinConfidence.Value) || query.MinConfidence.Value < 0 || query.MinConfidence.Value > 1))
             return FigureErrors.InvalidConfidence(query.MinConfidence.Value);
 
         var filtered = resolved.Figures

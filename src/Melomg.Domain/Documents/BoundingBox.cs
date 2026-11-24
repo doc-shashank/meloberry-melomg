@@ -30,10 +30,13 @@ public sealed record BoundingBox(double X, double Y, double Width, double Height
         if (x < 0 || y < 0)
             return FigureErrors.InvalidBoundingBox("Origin coordinates (x, y) must be non-negative.");
 
-        if (width <= 0 || height <= 0)
-            return FigureErrors.InvalidBoundingBox("Width and height must be positive.");
+        double rx = Math.Round(x, 2), ry = Math.Round(y, 2);
+        double rw = Math.Round(width, 2), rh = Math.Round(height, 2);
 
-        return new BoundingBox(Math.Round(x, 2), Math.Round(y, 2), Math.Round(width, 2), Math.Round(height, 2));
+        if (rw <= 0 || rh <= 0)
+            return FigureErrors.InvalidBoundingBox("Width and height must be positive (at least 0.01 pts).");
+
+        return new BoundingBox(rx, ry, rw, rh);
     }
 
     public Result ValidateWithinPage(double pageWidthPts, double pageHeightPts)

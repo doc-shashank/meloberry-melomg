@@ -22,4 +22,14 @@ Enforced by `Melomg.ArchitectureTests`: `Domain` has zero dependencies and stric
 - `DocumentFigures`: `Id`, `SortIndex`, `PageNumber`, `PageFigureIndex`, `Category`, `BboxX..H`, `Confidence`, `Caption`, `Label`, `Source`, `LastExtractedPath`, `CaptionBboxX..H`, `VocabPrefix`, `FigureNumber`, `NormalizedNumber`
 - `DocumentFigureMasks`: `FigureId`, `MaskIndex`, `BboxX..H`, `LabelText`, `Style`, `ColorHex`
 
-Legacy DB rows with removed categories (`table`, `formula`) are skipped cleanly on rehydration.
+Legacy DB rows with removed categories (`table`, `formula`) are skipped cleanly on rehydration, and remaining figures are re-indexed contiguously (`1..N`) with cleared `FigureNumber` values preserved across reloads.
+
+## 3. Concurrency, Cleanup & Integrity Guarantees
+
+- **SQLite Concurrency**: Settings and workspace SQLite connections set `Default Timeout=5` and `PRAGMA busy_timeout = 5000`; write connections enable `PRAGMA journal_mode = WAL`. Directory discovery ignores inaccessible subdirectories (`IgnoreInaccessible = true`).
+- **Cross-Process Monotonic IDs**: `MonotonicTimestampIdGenerator` coordinates `.melomg_id_clock` access via a per-clock Windows named `Mutex` (`Local\MelomgIdClock_<sha256>`) with bounded exclusive file-lock retries.
+- **Safe Workspace Cleanup**:
+  - `rm` deletes only melomg-owned artifacts (`Doc_*.db`, `-wal`/`-shm`, `.qa_overlays`, generated `page_*` / `fig_*` / `Fig_*` / `manifest.json`) and removes directories only when empty.
+  - QA overlay cleanup (`QaOverlayManifestHelper`) removes only verified `*_overlay.{png,jpg}` files and only deletes empty directories strictly inside the workspace root (never external user directories).
+  - Standard `ingest` and one-shot `extract --retain-db` clean up uncommitted workspace folders on failure so zero orphaned `Doc_*` directories remain.
+- **Refresh Snapshot Integrity**: `ingest --refresh` updates `Sha256Hash`, `Pages`, and `IngestedAtUtc` alongside refreshed figure detections so subsequent `check` runs validate against the updated PDF.

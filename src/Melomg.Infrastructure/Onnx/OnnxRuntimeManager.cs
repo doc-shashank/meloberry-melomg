@@ -411,11 +411,15 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
             }
         }
 
-        if (!string.IsNullOrWhiteSpace(expectedSha256))
+        string actualSha = Convert.ToHexStringLower(hasher.GetHashAndReset());
+        if (string.IsNullOrWhiteSpace(expectedSha256))
         {
-            string actualSha = Convert.ToHexStringLower(hasher.GetHashAndReset());
-            if (!string.Equals(actualSha, expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"{label} SHA-256 verification failed.");
+            if (_options.RequirePinnedSha256)
+                throw new InvalidDataException($"{label} SHA-256 digest is not configured; refusing unverified download.");
+        }
+        else if (!string.Equals(actualSha, expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"{label} SHA-256 verification failed (got {actualSha}).");
         }
     }
 

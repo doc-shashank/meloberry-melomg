@@ -5,6 +5,10 @@ using Melomg.Domain.Documents;
 
 namespace Melomg.Application.UseCases.Diagnostics;
 
+public sealed class LowercaseLintSeverityConverter()
+    : System.Text.Json.Serialization.JsonStringEnumConverter<LintSeverity>(System.Text.Json.JsonNamingPolicy.CamelCase);
+
+[System.Text.Json.Serialization.JsonConverter(typeof(LowercaseLintSeverityConverter))]
 public enum LintSeverity { Warning, Error }
 
 public sealed record LintIssue(string Code, LintSeverity Severity, string EntityId, string Message);
@@ -17,7 +21,9 @@ public sealed record LintReportResponse(
     int ErrorCount,
     int WarningCount,
     IReadOnlyList<LintIssue> Issues,
-    IReadOnlyList<int>? SuspectPages = null);
+    IReadOnlyList<int>? SuspectPages = null,
+    int? CheckedFigureCount = null,
+    bool? SourcePdfVerified = null);
 
 public sealed class LintDocumentHandler(
     AddressResolver resolver,
@@ -47,6 +53,7 @@ public sealed class LintDocumentHandler(
                 $"Workspace directory or 'figures/' folder is missing under '{storageDir}'."));
         }
 
+        bool sourcePdfVerified = false;
         if (!workingDirectoryProvider.FileExists(document.StoredPdfPath))
         {
             issues.Add(new LintIssue("Lint.MissingSourcePdf", LintSeverity.Error, document.Id,
@@ -57,6 +64,8 @@ public sealed class LintDocumentHandler(
             var integrity = await pdfEngine.VerifyPdfIntegrityAsync(document.StoredPdfPath, document.Sha256Hash, cancellationToken);
             if (!integrity.IsSuccess)
                 issues.Add(new LintIssue("Lint.CorruptedSourcePdf", LintSeverity.Error, document.Id, integrity.Error!.Description));
+            else
+                sourcePdfVerified = true;
         }
 
         if (isDocTarget && document.Figures.Count == 0)
@@ -78,6 +87,20 @@ public sealed class LintDocumentHandler(
             var boundsCheck = fig.BoundingBox.ValidateWithinPage(page.WidthPts, page.HeightPts);
             if (!boundsCheck.IsSuccess)
                 issues.Add(new LintIssue("Lint.OutOfPageBounds", LintSeverity.Error, fig.Id, boundsCheck.Error!.Description));
+
+            if (fig.CaptionBoundingBox is { } capBox)
+            {
+                var capCheck = capBox.ValidateWithinPage(page.WidthPts, page.HeightPts);
+                if (!capCheck.IsSuccess)
+                    issues.Add(new LintIssue("Lint.OutOfPageBounds", LintSeverity.Error, fig.Id, $"Caption box: {capCheck.Error!.Description}"));
+            }
+
+            foreach (var mask in fig.LabelMasks)
+            {
+                var maskCheck = mask.BoundingBox.ValidateWithinPage(page.WidthPts, page.HeightPts);
+                if (!maskCheck.IsSuccess)
+                    issues.Add(new LintIssue("Lint.OutOfPageBounds", LintSeverity.Error, fig.Id, $"Mask #{mask.Index}: {maskCheck.Error!.Description}"));
+            }
 
             if (!string.IsNullOrWhiteSpace(fig.LastExtractedPath))
             {
@@ -102,8 +125,18 @@ public sealed class LintDocumentHandler(
 
         int errorCount = issues.Count(i => i.Severity == LintSeverity.Error);
         int warningCount = issues.Count - errorCount;
-        var returnedIssues = query.Quiet && errorCount == 0 && warningCount == 0 ? [] : issues;
-        return new LintReportResponse(reportedId, IsClean: errorCount == 0, errorCount, warningCount, returnedIssues, suspectPages);
+        var returnedIssues = query.Quiet
+            ? issues.Where(i => i.Severity == LintSeverity.Error).ToList()
+            : issues;
+        return new LintReportResponse(
+            reportedId,
+            IsClean: errorCount == 0,
+            errorCount,
+            warningCount,
+            returnedIssues,
+            suspectPages,
+            CheckedFigureCount: query.Verbose ? figuresToCheck.Count : null,
+            SourcePdfVerified: query.Verbose ? sourcePdfVerified : null);
     }
 
     private static string MapAnomalyLintCode(string anomalyCode) => anomalyCode switch

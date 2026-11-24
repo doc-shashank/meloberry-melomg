@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using Melomg.Application.Abstractions;
 using Melomg.Application.UseCases.Runtime;
@@ -44,6 +45,10 @@ public sealed class OnnxRuntimeAndYoloTests
                 DirectMlRedistPackageUrl = "https://test.local/dml-redist.nupkg",
                 CpuRuntimePackageUrl = "https://test.local/ort-cpu.nupkg",
                 PretrainedModelDownloadUrl = "https://test.local/doclayout.onnx",
+                ExpectedDirectMlRuntimeSha256 = Sha256Hex(ortPkg),
+                ExpectedDirectMlRedistSha256 = Sha256Hex(dmlPkg),
+                ExpectedCpuRuntimeSha256 = Sha256Hex(ortPkg),
+                ExpectedPretrainedModelSha256 = Sha256Hex(modelBytes),
                 HttpMessageHandlerOverride = handler
             };
 
@@ -272,6 +277,11 @@ public sealed class OnnxRuntimeAndYoloTests
             byte[] dmlPkg = BuildZipArchive(("bin/x64-win/DirectML.dll", BuildFakePeBytes("DIRECTML_BIN")));
             byte[] goodModel = OnnxProtobufEngine.BuildCompactDocLayoutOnnxModel(1024, 1024, 17);
 
+            opts.ExpectedDirectMlRuntimeSha256 = Sha256Hex(ortPkg);
+            opts.ExpectedCpuRuntimeSha256 = Sha256Hex(ortPkg);
+            opts.ExpectedDirectMlRedistSha256 = Sha256Hex(dmlPkg);
+            opts.ExpectedPretrainedModelSha256 = Sha256Hex(goodModel);
+
             opts.HttpMessageHandlerOverride = new MockDownloadHandler(new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
             {
                 ["https://test.local/ort-dml.nupkg"] = ortPkg,
@@ -443,6 +453,139 @@ public sealed class OnnxRuntimeAndYoloTests
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
             => Task.FromResult(_responder(request));
     }
+
+    [Fact]
+    public async Task Phase1_Bug1_Bug2_Bug3_Bug27_RegressionsPass()
+    {
+        var tempRoot = CreateTempDirectory();
+        try
+        {
+            // Bug 1: Out-of-range YOLO classId is dropped instead of falling back to "figure",
+            // and ONNX models without embedded class metadata keep EmbeddedClasses == null.
+            var unknownClsDecoded = NativeOnnxRuntimeSessionHost.DecodeYoloOutput(
+                [100f, 100f, 400f, 400f, 0.95f, 99f, 100f, 100f, 400f, 400f, 0.95f, -1f],
+                [1, 2, 6],
+                1024, 1024, 1f, 0f, 0f, 1024, 1024, 0.35, 0.45);
+            Assert.Empty(unknownClsDecoded.Figures);
+            Assert.Empty(unknownClsDecoded.CaptionNormalizedBoxes);
+
+            // Bug 2: Default storage options pin SHA-256 digests and RequirePinnedSha256 = true;
+            // refusing unconfigured digests and mismatched downloads.
+            var defaultOpts = new MelomgStorageOptions();
+            Assert.True(defaultOpts.RequirePinnedSha256);
+            Assert.Equal(64, defaultOpts.ExpectedDirectMlRuntimeSha256?.Length);
+            Assert.Equal(64, defaultOpts.ExpectedDirectMlRedistSha256?.Length);
+            Assert.Equal(64, defaultOpts.ExpectedCpuRuntimeSha256?.Length);
+            Assert.Equal("fece9af02f618b603ff7921ccec6861d13e7e1f9830e091dfb7e8ad9311e5b21", defaultOpts.ExpectedPretrainedModelSha256);
+            Assert.DoesNotContain("/resolve/main/", defaultOpts.PretrainedModelDownloadUrl, StringComparison.OrdinalIgnoreCase);
+
+            byte[] ortPkg = BuildZipArchive(("runtimes/win-x64/native/onnxruntime.dll", BuildFakePeBytes("ORT_MAIN")));
+            var unpinnedOpts = new MelomgStorageOptions
+            {
+                AppDataDirectory = Path.Combine(tempRoot, "appdata_unpinned"),
+                VerifyNativeLoadOnInstall = false,
+                CpuRuntimePackageUrl = "https://test.local/ort-cpu.nupkg",
+                ExpectedCpuRuntimeSha256 = null,
+                RequirePinnedSha256 = true,
+                HttpMessageHandlerOverride = new MockDownloadHandler(new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["https://test.local/ort-cpu.nupkg"] = ortPkg
+                })
+            };
+            var onnxEngine = new OnnxProtobufEngine(unpinnedOpts);
+            using var sessionHost = new NativeOnnxRuntimeSessionHost();
+            var rtManager = new OnnxRuntimeManager(unpinnedOpts, onnxEngine, sessionHost);
+            var unpinnedRes = await rtManager.InstallAsync(new OnnxRuntimeInstallRequest("cpu", IncludeModel: false));
+            Assert.False(unpinnedRes.IsSuccess);
+            Assert.Contains("not configured", unpinnedRes.Error!.Description, StringComparison.OrdinalIgnoreCase);
+
+            unpinnedOpts.ExpectedCpuRuntimeSha256 = new string('0', 64);
+            var mismatchRes = await rtManager.InstallAsync(new OnnxRuntimeInstallRequest("cpu", IncludeModel: false));
+            Assert.False(mismatchRes.IsSuccess);
+            Assert.Contains("SHA-256 verification failed", mismatchRes.Error!.Description, StringComparison.OrdinalIgnoreCase);
+
+            // Bug 3: DeleteDocumentAsync never deletes user PDFs or unrelated files in project_* / Doc_* folders.
+            var projDir = Path.Combine(tempRoot, "project_safe_rm");
+            Directory.CreateDirectory(projDir);
+            var userPdf = Path.Combine(projDir, "source_book.pdf");
+            var userNotes = Path.Combine(projDir, "user_notes.txt");
+            await File.WriteAllBytesAsync(userPdf, BuildRotatedOctalPdfBytes());
+            await File.WriteAllTextAsync(userNotes, "keep me");
+
+            var settingsRepo = new SqliteModelSettingsRepository(unpinnedOpts, onnxEngine);
+            var repo = new SqliteDocumentWorkspaceRepository(settingsRepo, new WorkingDirectoryProvider());
+            var doc = PdfDocument.Create(
+                "Doc_safe_rm", "Safe RM", userPdf, userPdf,
+                Sha256Hex(await File.ReadAllBytesAsync(userPdf)),
+                projDir, "model.onnx", 0.35, DateTimeOffset.UtcNow,
+                [new PdfPageInfo(1, 612, 792, 0)], WorkspaceMode.Project).Value;
+            await repo.CreateDocumentAsync(doc);
+            await File.WriteAllBytesAsync(Path.Combine(projDir, "figures", "fig_001.png"), [1, 2, 3]);
+            await File.WriteAllTextAsync(Path.Combine(projDir, "figures", "custom_user_file.txt"), "keep me too");
+
+            await repo.DeleteDocumentAsync(doc.Id);
+
+            Assert.False(File.Exists(Path.Combine(projDir, "Doc_safe_rm.db")));
+            Assert.False(File.Exists(Path.Combine(projDir, "figures", "fig_001.png")));
+            Assert.True(File.Exists(userPdf));
+            Assert.True(File.Exists(userNotes));
+            Assert.True(File.Exists(Path.Combine(projDir, "figures", "custom_user_file.txt")));
+
+            // Bug 27: Form XObject with /ProcSet [/PDF /Text /ImageB /ImageC] is parsed as Form, not misclassified as raster /Image.
+            var formPdfPath = Path.Combine(tempRoot, "form_procset_imageb.pdf");
+            await File.WriteAllBytesAsync(formPdfPath, BuildFormXObjectWithImageProcSetPdfBytes());
+            var renderer = new WindowsPdfPageRenderer();
+            var engine = new HybridOnnxPdfIngestionEngine(onnxEngine, renderer, sessionHost, rtManager);
+            var builtInProfile = await onnxEngine.GetBuiltInDefaultProfileAsync();
+            var formAnalysis = await engine.AnalyzePdfAsync(formPdfPath, builtInProfile);
+            Assert.True(formAnalysis.IsSuccess, formAnalysis.Error?.Description);
+            Assert.Contains(formAnalysis.Value.Candidates, c =>
+                string.Equals(c.FigureNumber, "7.1", StringComparison.OrdinalIgnoreCase) &&
+                (c.Caption?.Contains("Nested form caption", StringComparison.OrdinalIgnoreCase) ?? false));
+        }
+        finally
+        {
+            TryDelete(tempRoot);
+        }
+    }
+
+    private static byte[] BuildFormXObjectWithImageProcSetPdfBytes()
+    {
+        byte[] pageContent = Encoding.Latin1.GetBytes("q 1 0 0 1 0 0 cm /Fm1 Do Q\n");
+        byte[] formContent = Encoding.Latin1.GetBytes(
+            "q 240 0 0 160 80 420 cm /Im1 Do Q\nBT /F1 11 Tf 80 395 Td (Fig. 7.1 Nested form caption) Tj ET\n");
+        byte[] rgb = new byte[8 * 8 * 3];
+        using var zMs = new MemoryStream();
+        using (var z = new ZLibStream(zMs, CompressionLevel.Optimal, leaveOpen: true))
+            z.Write(rgb, 0, rgb.Length);
+        byte[] imgBytes = zMs.ToArray();
+
+        using var pdf = new MemoryStream();
+        void W(string s) { var b = Encoding.Latin1.GetBytes(s); pdf.Write(b, 0, b.Length); }
+        W("%PDF-1.4\n");
+        var offs = new List<long>();
+        void Obj(int id) { offs.Add(pdf.Position); W($"{id} 0 obj\n"); }
+        Obj(1); W("<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        Obj(2); W("<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>\nendobj\n");
+        Obj(3); W("<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Fm1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n");
+        Obj(4); W($"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] /XObject << /Im1 6 0 R >> /Font << /F1 7 0 R >> >> /Length {formContent.Length} >>\nstream\n");
+        pdf.Write(formContent, 0, formContent.Length);
+        W("\nendstream\nendobj\n");
+        Obj(5); W($"<< /Length {pageContent.Length} >>\nstream\n");
+        pdf.Write(pageContent, 0, pageContent.Length);
+        W("\nendstream\nendobj\n");
+        Obj(6); W($"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {imgBytes.Length} >>\nstream\n");
+        pdf.Write(imgBytes, 0, imgBytes.Length);
+        W("\nendstream\nendobj\n");
+        Obj(7); W("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+        long xref = pdf.Position;
+        W($"xref\n0 {offs.Count + 1}\n0000000000 65535 f \n");
+        foreach (var o in offs) W($"{o:D10} 00000 n \n");
+        W($"trailer\n<< /Size {offs.Count + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n");
+        return pdf.ToArray();
+    }
+
+    private static string Sha256Hex(byte[] data) => Convert.ToHexStringLower(SHA256.HashData(data));
 
     private static byte[] BuildZipArchive(params (string EntryPath, byte[] Content)[] files)
     {

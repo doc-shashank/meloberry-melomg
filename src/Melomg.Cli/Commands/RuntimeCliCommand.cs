@@ -22,7 +22,11 @@ public sealed class RuntimeCliCommand : CliCommand
                 "melomg runtime install",
                 "melomg runtime install --provider cpu --skip-model",
                 "melomg runtime uninstall"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "provider", "skip-model", "keep-model", "force"
+            }))
     {
     }
 
@@ -41,6 +45,9 @@ public sealed class RuntimeCliCommand : CliCommand
             {
                 case "status":
                 {
+                    if (context.PositionalArgs.Count != 1)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
+
                     var res = await getStatus.HandleAsync(new GetRuntimeStatusQuery(), context.CancellationToken);
                     if (!res.IsSuccess)
                         return res.ToExitCode(context.Console, context.GlobalOptions.Json);
@@ -51,6 +58,9 @@ public sealed class RuntimeCliCommand : CliCommand
 
                 case "install":
                 {
+                    if (context.PositionalArgs.Count != 1)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
+
                     string provider = context.NamedOptions.TryGetValue("provider", out var pVal) && !string.IsNullOrWhiteSpace(pVal)
                         ? pVal
                         : "directml";
@@ -61,7 +71,7 @@ public sealed class RuntimeCliCommand : CliCommand
                         new InstallRuntimeCommand(provider, includeModel, force),
                         msg =>
                         {
-                            if (!context.GlobalOptions.Silent)
+                            if (!context.GlobalOptions.Silent && !context.GlobalOptions.Json)
                                 context.Console.Error.WriteLine(msg);
                         },
                         context.CancellationToken);
@@ -75,6 +85,9 @@ public sealed class RuntimeCliCommand : CliCommand
 
                 case "uninstall":
                 {
+                    if (context.PositionalArgs.Count != 1)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
+
                     bool keepModel = context.NamedOptions.ContainsKey("keep-model");
                     var res = await uninstallRuntime.HandleAsync(new UninstallRuntimeCommand(keepModel), context.CancellationToken);
                     if (!res.IsSuccess)

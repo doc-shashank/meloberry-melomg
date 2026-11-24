@@ -49,7 +49,8 @@ public interface IModelSettingsRepository
 
 public sealed record OnnxModelMetadata(
     string ModelName, string ModelPath, bool IsBuiltIn, long IrVersion, int OpsetVersion, string ProducerName,
-    int InputWidth, int InputHeight, string InputTensorName, string OutputTensorName, IReadOnlyList<string> SupportedClasses);
+    int InputWidth, int InputHeight, string InputTensorName, string OutputTensorName,
+    IReadOnlyList<string> SupportedClasses, IReadOnlyList<string>? EmbeddedClasses = null);
 
 public interface IOnnxModelInspector
 {

@@ -14,9 +14,17 @@ All commands are strictly verb-first, stateless, and non-interactive. Pass `-` f
 | `add` | `melomg add <docId> <p> <x> <y> <w> <h> [--category figure\|diagram\|chart] [--num n] [--caption t] [--label t] [--index i]`<br>`melomg add <docId> <file\|->` | Manually register an image, diagram, or chart box |
 | `mask` | `melomg mask <figAddr> <ls\|add\|auto\|rm\|clear> [args...]` | Manage label redaction masks on a figure |
 | `render` | `melomg render <docId> <page\|all> [-o dir] [--format png\|jpg] [--dpi n] [--quality q] [--overlay]` | Render full PDF pages for QA inspection |
-| `rm` | `melomg rm <addr>` | Delete document workspace or figure immediately |
-| `check` | `melomg check <addr> [--quiet] [--verbose]` | Verify PDF SHA-256, page bounds, extracted image headers, and sequence/duplicate anomalies |
-| `batch` | `melomg batch <file\|->` | Execute JSON op array sequentially with `$0.id` / `$prev.id` interpolation |
+| `rm` | `melomg rm <addr>` | Delete document workspace artifacts (never user PDFs/unrelated files) or a single figure immediately |
+| `check` | `melomg check <addr> [--quiet] [--verbose]` | Verify PDF SHA-256, figure/caption/mask page bounds, extracted image headers, and sequence/duplicate anomalies (`--quiet` omits warnings; `--verbose` reports checked figure count & PDF verification) |
+| `batch` | `melomg batch <file\|-> [-o dir]` | Execute strict-typed JSON op array sequentially (`ingest`, `get`, `extract`, `patch`, `add`, `mask` incl. `add`, `render`, `check`, `rm`) with `$0.id` / `$prev.id` interpolation |
 | `model` | `melomg model <info\|set\|threshold\|reset> [args...]` | Inspect, set, tune thresholds, or reset ONNX model |
-| `runtime` | `melomg runtime <status\|install\|uninstall> [--provider directml\|cpu] [--skip-model] [--keep-model] [--force]` | Manage AppData ONNX Runtime DLLs and DocLayout-YOLO weights |
+| `runtime` | `melomg runtime <status\|install\|uninstall> [--provider directml\|cpu] [--skip-model] [--keep-model] [--force]` | Manage AppData ONNX Runtime DLLs and DocLayout-YOLO weights (verified via pinned SHA-256 digests) |
 | `version` | `melomg version` *(or `-v` / `--version`)* | Print CLI version and .NET runtime |
+
+## Strict Validation Notes
+
+- **Path vs. Entity ID Routing**: Files or directories on disk (including filenames starting with `Doc_` or `Fig_`, e.g., `Doc_sample.pdf`) are always treated as filesystem paths rather than entity IDs.
+- **Literal Number Escaping (`#n:<raw>` / `n:<raw>`)**: Always matches literal figure numbers and never falls back to 1-based figure indices.
+- **Target & Filter Hygiene**: `extract <docId>#<num>` rejects extra trailing selectors; `get <singleFigure>` rejects list filters (`--page`, `--category`, `--min-conf`); `patch` on a figure requires at least one field; `add` rejects specifying both `--index` and a 7th positional index; per-command option allowlists reject flags belonging to other commands with `Cli.InvalidOption`.
+- **Single Workspace per Project Directory**: `ingest --project -o <dir>` returns exit `4` (`Project.AlreadyExists`) if `<dir>` already contains a `Doc_*.db` workspace.
+- **JSON Help & Error Envelopes**: `<cmd> --help --json` emits a valid JSON envelope on `stdout`. Failed `check --json` exits `2`, writes `0` bytes to `stdout`, and emits `Lint.Failed` with the full `LintReportResponse` inside `error.details` on `stderr` (with lowercase `"warning"`/`"error"` severities).

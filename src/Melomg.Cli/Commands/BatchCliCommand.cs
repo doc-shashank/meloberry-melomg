@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -23,7 +24,8 @@ public sealed partial class BatchCliCommand : CliCommand
             Description: "Executes a JSON array of operations sequentially with $0.id / $prev.id reference interpolation.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Diagnostics,
-            Examples: ["melomg batch ops.json --json", "melomg batch - --json < ops.json"]))
+            Examples: ["melomg batch ops.json --json", "melomg batch - --json < ops.json"],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 
@@ -34,6 +36,7 @@ public sealed partial class BatchCliCommand : CliCommand
         PatchTargetHandler patchHandler,
         AddManualFigureHandler addHandler,
         ListFigureMasksHandler listMasksHandler,
+        AddFigureMaskHandler addMaskHandler,
         AutoMaskFigureLabelsHandler autoMaskHandler,
         RemoveFigureMaskHandler removeMaskHandler,
         ClearFigureMasksHandler clearMasksHandler,
@@ -75,10 +78,13 @@ public sealed partial class BatchCliCommand : CliCommand
                     if (elem.ValueKind != JsonValueKind.Object)
                         return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", "Each batch entry must be an object.", context.GlobalOptions.Json, path: stepPath);
 
-                    if (!TryGetString(elem, "op", out var op) || string.IsNullOrWhiteSpace(op))
+                    var opRes = ReadOptionalString(elem, "op", stepPath);
+                    if (!opRes.IsSuccess)
+                        return Result.Failure(opRes.Error!).ToExitCode(context.Console, context.GlobalOptions.Json);
+                    if (string.IsNullOrWhiteSpace(opRes.Value))
                         return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", "Missing required 'op' string.", context.GlobalOptions.Json, path: $"{stepPath}.op");
 
-                    op = op.Trim().ToLowerInvariant();
+                    string op = opRes.Value.Trim().ToLowerInvariant();
                     if (!ValidateOpProperties(elem, op, stepPath, out var propErr))
                         return CliResultExtensions.WriteValidationError(context.Console, "Json.ParseError", propErr!, context.GlobalOptions.Json, path: stepPath);
 
@@ -122,22 +128,44 @@ public sealed partial class BatchCliCommand : CliCommand
             {
                 case "ingest":
                 {
-                    if (!TryGetString(elem, "pdf", out var pdf) || string.IsNullOrWhiteSpace(pdf))
-                        return new Error("Json.ParseError", "ingest requires 'pdf'.", ErrorType.Validation, Path: $"{stepPath}.pdf");
+                    var pdfRes = ResolveInterpolatedString(elem, "pdf", stepPath, stepIds, prevId);
+                    if (!pdfRes.IsSuccess) return pdfRes.Error!;
 
-                    TryGetString(elem, "out", out var outDir);
-                    TryGetBool(elem, "project", out bool project);
-                    TryGetBool(elem, "refresh", out bool refresh);
-                    TryGetBool(elem, "offline", out bool offline);
-                    TryGetBool(elem, "retainDb", out bool retainDb);
-                    TryGetBool(elem, "quiet", out bool quiet);
-                    TryGetBool(elem, "verbose", out bool verbose);
-                    TryGetDouble(elem, "confidence", out var conf);
-                    TryGetString(elem, "model", out var model);
-                    TryGetString(elem, "title", out var title);
+                    var outDirRes = ReadOptionalString(elem, "out", stepPath);
+                    if (!outDirRes.IsSuccess) return outDirRes.Error!;
+                    var projectRes = ReadOptionalBool(elem, "project", stepPath);
+                    if (!projectRes.IsSuccess) return projectRes.Error!;
+                    var refreshRes = ReadOptionalBool(elem, "refresh", stepPath);
+                    if (!refreshRes.IsSuccess) return refreshRes.Error!;
+                    var offlineRes = ReadOptionalBool(elem, "offline", stepPath);
+                    if (!offlineRes.IsSuccess) return offlineRes.Error!;
+                    var retainDbRes = ReadOptionalBool(elem, "retainDb", stepPath);
+                    if (!retainDbRes.IsSuccess) return retainDbRes.Error!;
+                    var quietRes = ReadOptionalBool(elem, "quiet", stepPath);
+                    if (!quietRes.IsSuccess) return quietRes.Error!;
+                    var verboseRes = ReadOptionalBool(elem, "verbose", stepPath);
+                    if (!verboseRes.IsSuccess) return verboseRes.Error!;
+                    var confRes = ReadOptionalDouble(elem, "confidence", stepPath);
+                    if (!confRes.IsSuccess) return confRes.Error!;
+                    var modelRes = ReadOptionalString(elem, "model", stepPath);
+                    if (!modelRes.IsSuccess) return modelRes.Error!;
+                    var titleRes = ReadOptionalString(elem, "title", stepPath);
+                    if (!titleRes.IsSuccess) return titleRes.Error!;
 
                     var res = await ingestHandler.HandleAsync(
-                        new IngestPdfCommand(pdf, outDir, project, refresh, conf, model ?? context.GlobalOptions.ModelPath, title, offline, retainDb || project, quiet, verbose), ct);
+                        new IngestPdfCommand(
+                            pdfRes.Value!,
+                            outDirRes.Value ?? context.GlobalOptions.OutputDirectory,
+                            projectRes.Value,
+                            refreshRes.Value,
+                            confRes.Value,
+                            modelRes.Value ?? context.GlobalOptions.ModelPath,
+                            titleRes.Value,
+                            offlineRes.Value,
+                            retainDbRes.Value || projectRes.Value,
+                            quietRes.Value,
+                            verboseRes.Value),
+                        ct);
                     return res.IsSuccess ? Result<string?>.Success(res.Value.Id) : res.Error!;
                 }
 
@@ -145,18 +173,36 @@ public sealed partial class BatchCliCommand : CliCommand
                 {
                     var addrRes = ResolveInterpolatedString(elem, "addr", stepPath, stepIds, prevId);
                     if (!addrRes.IsSuccess) return addrRes.Error!;
-                    TryGetString(elem, "view", out var viewStr);
-                    ViewMode view = (viewStr ?? "outline").Trim().ToLowerInvariant() switch
-                    {
-                        "full" => ViewMode.Full,
-                        "ids" => ViewMode.Ids,
-                        _ => ViewMode.Outline
-                    };
-                    TryGetInt(elem, "page", out var page);
-                    TryGetString(elem, "category", out var category);
-                    TryGetDouble(elem, "minConf", out var minConf);
 
-                    var res = await getHandler.HandleAsync(new GetTargetQuery(addrRes.Value!, view, page, category, minConf), ct);
+                    var viewRes = ReadOptionalString(elem, "view", stepPath);
+                    if (!viewRes.IsSuccess) return viewRes.Error!;
+
+                    ViewMode view;
+                    if (viewRes.Value is null)
+                    {
+                        view = ViewMode.Outline;
+                    }
+                    else
+                    {
+                        switch (viewRes.Value.Trim().ToLowerInvariant())
+                        {
+                            case "outline": view = ViewMode.Outline; break;
+                            case "full": view = ViewMode.Full; break;
+                            case "ids": view = ViewMode.Ids; break;
+                            default:
+                                return new Error("Cli.InvalidView", $"View '{viewRes.Value}' must be outline, full, or ids.", ErrorType.Validation, Path: $"{stepPath}.view");
+                        }
+                    }
+
+                    var pageRes = ReadOptionalInt(elem, "page", stepPath);
+                    if (!pageRes.IsSuccess) return pageRes.Error!;
+                    var categoryRes = ReadOptionalString(elem, "category", stepPath);
+                    if (!categoryRes.IsSuccess) return categoryRes.Error!;
+                    var minConfRes = ReadOptionalDouble(elem, "minConf", stepPath);
+                    if (!minConfRes.IsSuccess) return minConfRes.Error!;
+
+                    var res = await getHandler.HandleAsync(
+                        new GetTargetQuery(addrRes.Value!, view, pageRes.Value, categoryRes.Value, minConfRes.Value), ct);
                     return res.IsSuccess ? Result<string?>.Success(res.Value.Figure?.FigureId ?? res.Value.DocumentId) : res.Error!;
                 }
 
@@ -166,42 +212,69 @@ public sealed partial class BatchCliCommand : CliCommand
                     if (!addrRes.IsSuccess) return addrRes.Error!;
 
                     List<string>? selectors = null;
-                    if (elem.TryGetProperty("selectors", out var selArr) && selArr.ValueKind == JsonValueKind.Array)
+                    if (elem.TryGetProperty("selectors", out var selArr) && selArr.ValueKind != JsonValueKind.Null)
                     {
+                        if (selArr.ValueKind != JsonValueKind.Array)
+                            return new Error("Json.ParseError", "'selectors' must be an array of strings.", ErrorType.Validation, Path: $"{stepPath}.selectors");
+
                         selectors = [];
+                        int selIdx = 0;
                         foreach (var item in selArr.EnumerateArray())
                         {
-                            if (item.ValueKind == JsonValueKind.String && item.GetString() is { } s)
-                                selectors.Add(s);
+                            if (item.ValueKind != JsonValueKind.String || item.GetString() is not { } s)
+                                return new Error("Json.ParseError", "Every item in 'selectors' must be a string.", ErrorType.Validation, Path: $"{stepPath}.selectors[{selIdx}]");
+                            selectors.Add(s);
+                            selIdx++;
                         }
                     }
 
-                    TryGetString(elem, "out", out var outDir);
-                    TryGetString(elem, "format", out var format);
-                    TryGetInt(elem, "dpi", out var dpi);
-                    TryGetInt(elem, "padding", out var padding);
-                    TryGetString(elem, "quality", out var quality);
-                    TryGetString(elem, "naming", out var naming);
-                    TryGetBool(elem, "includeCaption", out bool includeCaption);
-                    TryGetBool(elem, "maskAll", out bool maskAll);
-                    TryGetString(elem, "maskMatch", out var maskMatch);
-                    TryGetString(elem, "maskStyle", out var maskStyle);
-                    TryGetString(elem, "maskColor", out var maskColor);
-                    TryGetBool(elem, "noMasks", out bool noMasks);
-                    TryGetBool(elem, "meta", out bool meta);
-                    TryGetBool(elem, "keepOverlay", out bool keepOverlay);
-                    TryGetBool(elem, "retainDb", out bool retainDb);
-                    TryGetBool(elem, "offline", out bool offline);
-                    TryGetBool(elem, "manifest", out bool manifest);
-                    TryGetBool(elem, "quiet", out bool quiet);
-                    TryGetBool(elem, "verbose", out bool verbose);
+                    var outDirRes = ReadOptionalString(elem, "out", stepPath);
+                    if (!outDirRes.IsSuccess) return outDirRes.Error!;
+                    var formatRes = ReadOptionalString(elem, "format", stepPath);
+                    if (!formatRes.IsSuccess) return formatRes.Error!;
+                    var dpiRes = ReadOptionalInt(elem, "dpi", stepPath);
+                    if (!dpiRes.IsSuccess) return dpiRes.Error!;
+                    var paddingRes = ReadOptionalInt(elem, "padding", stepPath);
+                    if (!paddingRes.IsSuccess) return paddingRes.Error!;
+                    var qualityRes = ReadOptionalQuality(elem, "quality", stepPath);
+                    if (!qualityRes.IsSuccess) return qualityRes.Error!;
+                    var namingRes = ReadOptionalString(elem, "naming", stepPath);
+                    if (!namingRes.IsSuccess) return namingRes.Error!;
+                    var includeCaptionRes = ReadOptionalBool(elem, "includeCaption", stepPath);
+                    if (!includeCaptionRes.IsSuccess) return includeCaptionRes.Error!;
+                    var maskAllRes = ReadOptionalBool(elem, "maskAll", stepPath);
+                    if (!maskAllRes.IsSuccess) return maskAllRes.Error!;
+                    var maskMatchRes = ReadOptionalString(elem, "maskMatch", stepPath);
+                    if (!maskMatchRes.IsSuccess) return maskMatchRes.Error!;
+                    var maskStyleRes = ReadOptionalString(elem, "maskStyle", stepPath);
+                    if (!maskStyleRes.IsSuccess) return maskStyleRes.Error!;
+                    var maskColorRes = ReadOptionalString(elem, "maskColor", stepPath);
+                    if (!maskColorRes.IsSuccess) return maskColorRes.Error!;
+                    var noMasksRes = ReadOptionalBool(elem, "noMasks", stepPath);
+                    if (!noMasksRes.IsSuccess) return noMasksRes.Error!;
+                    var metaRes = ReadOptionalBool(elem, "meta", stepPath);
+                    if (!metaRes.IsSuccess) return metaRes.Error!;
+                    var keepOverlayRes = ReadOptionalBool(elem, "keepOverlay", stepPath);
+                    if (!keepOverlayRes.IsSuccess) return keepOverlayRes.Error!;
+                    var retainDbRes = ReadOptionalBool(elem, "retainDb", stepPath);
+                    if (!retainDbRes.IsSuccess) return retainDbRes.Error!;
+                    var offlineRes = ReadOptionalBool(elem, "offline", stepPath);
+                    if (!offlineRes.IsSuccess) return offlineRes.Error!;
+                    var manifestRes = ReadOptionalBool(elem, "manifest", stepPath);
+                    if (!manifestRes.IsSuccess) return manifestRes.Error!;
+                    var quietRes = ReadOptionalBool(elem, "quiet", stepPath);
+                    if (!quietRes.IsSuccess) return quietRes.Error!;
+                    var verboseRes = ReadOptionalBool(elem, "verbose", stepPath);
+                    if (!verboseRes.IsSuccess) return verboseRes.Error!;
 
                     var res = await extractHandler.HandleAsync(new ExtractFiguresCommand(
-                        addrRes.Value!, selectors, outDir ?? context.GlobalOptions.OutputDirectory,
-                        format ?? "png", dpi, padding ?? ExtractionOptions.DefaultPaddingPx,
-                        includeCaption, maskAll, maskMatch, noMasks, maskStyle, maskColor, quality,
-                        naming ?? ExtractionOptions.DefaultNamingMode, meta, keepOverlay, retainDb, offline,
-                        context.GlobalOptions.ModelPath, EmitManifest: manifest, Quiet: quiet, Verbose: verbose), ct);
+                        addrRes.Value!, selectors, outDirRes.Value ?? context.GlobalOptions.OutputDirectory,
+                        formatRes.Value ?? "png", dpiRes.Value, paddingRes.Value ?? ExtractionOptions.DefaultPaddingPx,
+                        includeCaptionRes.Value, maskAllRes.Value, maskMatchRes.Value, noMasksRes.Value,
+                        maskStyleRes.Value, maskColorRes.Value, qualityRes.Value,
+                        namingRes.Value ?? ExtractionOptions.DefaultNamingMode, metaRes.Value, keepOverlayRes.Value,
+                        retainDbRes.Value, offlineRes.Value, context.GlobalOptions.ModelPath,
+                        EmitManifest: manifestRes.Value, Quiet: quietRes.Value, Verbose: verboseRes.Value), ct);
 
                     return res.IsSuccess ? Result<string?>.Success(res.Value.DocumentId) : res.Error!;
                 }
@@ -213,31 +286,45 @@ public sealed partial class BatchCliCommand : CliCommand
                     if (!elem.TryGetProperty("set", out var setObj) || setObj.ValueKind != JsonValueKind.Object)
                         return new Error("Json.ParseError", "patch requires a 'set' object.", ErrorType.Validation, Path: $"{stepPath}.set");
 
-                    TryGetString(setObj, "title", out var title);
-                    TryGetString(setObj, "caption", out var caption);
-                    TryGetString(setObj, "label", out var label);
-                    TryGetString(setObj, "num", out var num);
-                    TryGetString(setObj, "category", out var category);
-                    TryGetString(setObj, "move", out var moveStr);
+                    string setPath = $"{stepPath}.set";
+                    foreach (var p in setObj.EnumerateObject())
+                    {
+                        if (p.Name is not ("title" or "bbox" or "caption" or "label" or "num" or "category" or "move"))
+                            return new Error("Json.ParseError", $"Unrecognized patch property '{p.Name}'.", ErrorType.Validation, Path: $"{setPath}.{p.Name}");
+                    }
+
+                    var titleRes = ReadOptionalString(setObj, "title", setPath);
+                    if (!titleRes.IsSuccess) return titleRes.Error!;
+                    var captionRes = ReadOptionalString(setObj, "caption", setPath);
+                    if (!captionRes.IsSuccess) return captionRes.Error!;
+                    var labelRes = ReadOptionalString(setObj, "label", setPath);
+                    if (!labelRes.IsSuccess) return labelRes.Error!;
+                    var numRes = ReadOptionalString(setObj, "num", setPath);
+                    if (!numRes.IsSuccess) return numRes.Error!;
+                    var categoryRes = ReadOptionalString(setObj, "category", setPath);
+                    if (!categoryRes.IsSuccess) return categoryRes.Error!;
+                    var moveRes = ReadOptionalString(setObj, "move", setPath);
+                    if (!moveRes.IsSuccess) return moveRes.Error!;
+
                     BoundingBox? bbox = null;
-                    if (setObj.TryGetProperty("bbox", out var bboxEl))
+                    if (setObj.TryGetProperty("bbox", out var bboxEl) && bboxEl.ValueKind != JsonValueKind.Null)
                     {
                         if (!TryParseBboxArray(bboxEl, out bbox))
-                            return new Error("Json.ParseError", "'bbox' must be [x, y, w, h].", ErrorType.Validation, Path: $"{stepPath}.set.bbox");
+                            return new Error("Json.ParseError", "'bbox' must be [x, y, w, h].", ErrorType.Validation, Path: $"{setPath}.bbox");
                     }
 
                     int? moveIdx = null;
                     ReorderMode? moveMode = null;
-                    if (!string.IsNullOrWhiteSpace(moveStr))
+                    if (!string.IsNullOrWhiteSpace(moveRes.Value))
                     {
-                        if (!CliCommandHelpers.TryParseMoveSpec(moveStr, out int mIdx, out var mMode))
-                            return new Error("Cli.InvalidMode", $"Invalid move '{moveStr}'.", ErrorType.Validation, Path: $"{stepPath}.set.move");
+                        if (!CliCommandHelpers.TryParseMoveSpec(moveRes.Value, out int mIdx, out var mMode))
+                            return new Error("Cli.InvalidMode", $"Invalid move '{moveRes.Value}'.", ErrorType.Validation, Path: $"{setPath}.move");
                         moveIdx = mIdx;
                         moveMode = mMode;
                     }
 
                     var res = await patchHandler.HandleAsync(
-                        new PatchTargetCommand(addrRes.Value!, title, bbox, caption, label, num, category, moveIdx, moveMode), ct);
+                        new PatchTargetCommand(addrRes.Value!, titleRes.Value, bbox, captionRes.Value, labelRes.Value, numRes.Value, categoryRes.Value, moveIdx, moveMode), ct);
                     return res.IsSuccess ? Result<string?>.Success(res.Value.TargetId) : res.Error!;
                 }
 
@@ -245,19 +332,26 @@ public sealed partial class BatchCliCommand : CliCommand
                 {
                     var addrRes = ResolveInterpolatedString(elem, "addr", stepPath, stepIds, prevId);
                     if (!addrRes.IsSuccess) return addrRes.Error!;
-                    if (!TryGetInt(elem, "page", out var page) || !page.HasValue)
+                    var pageRes = ReadOptionalInt(elem, "page", stepPath);
+                    if (!pageRes.IsSuccess) return pageRes.Error!;
+                    if (!pageRes.Value.HasValue)
                         return new Error("Json.ParseError", "add requires 'page'.", ErrorType.Validation, Path: $"{stepPath}.page");
                     if (!elem.TryGetProperty("bbox", out var bboxEl) || !TryParseBboxArray(bboxEl, out var bbox) || bbox is null)
                         return new Error("Json.ParseError", "add requires 'bbox': [x, y, w, h].", ErrorType.Validation, Path: $"{stepPath}.bbox");
 
-                    TryGetString(elem, "category", out var category);
-                    TryGetString(elem, "caption", out var caption);
-                    TryGetString(elem, "label", out var label);
-                    TryGetString(elem, "num", out var num);
-                    TryGetInt(elem, "index", out var index);
+                    var categoryRes = ReadOptionalString(elem, "category", stepPath);
+                    if (!categoryRes.IsSuccess) return categoryRes.Error!;
+                    var captionRes = ReadOptionalString(elem, "caption", stepPath);
+                    if (!captionRes.IsSuccess) return captionRes.Error!;
+                    var labelRes = ReadOptionalString(elem, "label", stepPath);
+                    if (!labelRes.IsSuccess) return labelRes.Error!;
+                    var numRes = ReadOptionalString(elem, "num", stepPath);
+                    if (!numRes.IsSuccess) return numRes.Error!;
+                    var indexRes = ReadOptionalInt(elem, "index", stepPath);
+                    if (!indexRes.IsSuccess) return indexRes.Error!;
 
                     var res = await addHandler.HandleAsync(
-                        new AddManualFigureCommand(addrRes.Value!, page.Value, bbox.X, bbox.Y, bbox.Width, bbox.Height, category, caption, label, num, index), ct);
+                        new AddManualFigureCommand(addrRes.Value!, pageRes.Value.Value, bbox.X, bbox.Y, bbox.Width, bbox.Height, categoryRes.Value, captionRes.Value, labelRes.Value, numRes.Value, indexRes.Value), ct);
                     return res.IsSuccess ? Result<string?>.Success(res.Value.FigureId) : res.Error!;
                 }
 
@@ -265,30 +359,58 @@ public sealed partial class BatchCliCommand : CliCommand
                 {
                     var addrRes = ResolveInterpolatedString(elem, "addr", stepPath, stepIds, prevId);
                     if (!addrRes.IsSuccess) return addrRes.Error!;
-                    if (!TryGetString(elem, "action", out var action) || string.IsNullOrWhiteSpace(action))
-                        return new Error("Json.ParseError", "mask requires 'action' (ls|auto|rm|clear).", ErrorType.Validation, Path: $"{stepPath}.action");
+                    var actionRes = ReadOptionalString(elem, "action", stepPath);
+                    if (!actionRes.IsSuccess) return actionRes.Error!;
+                    if (string.IsNullOrWhiteSpace(actionRes.Value))
+                        return new Error("Json.ParseError", "mask requires 'action' (ls|add|auto|rm|clear).", ErrorType.Validation, Path: $"{stepPath}.action");
 
-                    switch (action.Trim().ToLowerInvariant())
+                    switch (actionRes.Value.Trim().ToLowerInvariant())
                     {
                         case "ls" or "list":
                             var lsRes = await listMasksHandler.HandleAsync(new ListFigureMasksQuery(addrRes.Value!), ct);
                             return lsRes.IsSuccess ? Result<string?>.Success(lsRes.Value.FigureId) : lsRes.Error!;
+                        case "add":
+                        {
+                            if (!elem.TryGetProperty("bbox", out var maskBboxEl) || !TryParseBboxArray(maskBboxEl, out var maskBbox) || maskBbox is null)
+                                return new Error("Json.ParseError", "mask add requires 'bbox': [x, y, w, h].", ErrorType.Validation, Path: $"{stepPath}.bbox");
+                            var labelRes = ReadOptionalString(elem, "label", stepPath);
+                            if (!labelRes.IsSuccess) return labelRes.Error!;
+                            var styleRes = ReadOptionalString(elem, "style", stepPath);
+                            if (!styleRes.IsSuccess) return styleRes.Error!;
+                            var colorRes = ReadOptionalString(elem, "color", stepPath);
+                            if (!colorRes.IsSuccess) return colorRes.Error!;
+
+                            var addMaskRes = await addMaskHandler.HandleAsync(
+                                new AddFigureMaskCommand(addrRes.Value!, maskBbox.X, maskBbox.Y, maskBbox.Width, maskBbox.Height, labelRes.Value, styleRes.Value, colorRes.Value), ct);
+                            return addMaskRes.IsSuccess ? Result<string?>.Success(addMaskRes.Value.FigureId) : addMaskRes.Error!;
+                        }
                         case "auto":
-                            TryGetString(elem, "match", out var match);
-                            TryGetString(elem, "style", out var style);
-                            TryGetString(elem, "color", out var color);
-                            var autoRes = await autoMaskHandler.HandleAsync(new AutoMaskFigureLabelsCommand(addrRes.Value!, match, style, color), ct);
+                        {
+                            var matchRes = ReadOptionalString(elem, "match", stepPath);
+                            if (!matchRes.IsSuccess) return matchRes.Error!;
+                            var styleRes = ReadOptionalString(elem, "style", stepPath);
+                            if (!styleRes.IsSuccess) return styleRes.Error!;
+                            var colorRes = ReadOptionalString(elem, "color", stepPath);
+                            if (!colorRes.IsSuccess) return colorRes.Error!;
+
+                            var autoRes = await autoMaskHandler.HandleAsync(
+                                new AutoMaskFigureLabelsCommand(addrRes.Value!, matchRes.Value, styleRes.Value, colorRes.Value), ct);
                             return autoRes.IsSuccess ? Result<string?>.Success(autoRes.Value.FigureId) : autoRes.Error!;
+                        }
                         case "rm" or "remove":
-                            if (!TryGetInt(elem, "index", out var mIdx) || !mIdx.HasValue)
+                        {
+                            var mIdxRes = ReadOptionalInt(elem, "index", stepPath);
+                            if (!mIdxRes.IsSuccess) return mIdxRes.Error!;
+                            if (!mIdxRes.Value.HasValue)
                                 return new Error("Json.ParseError", "mask rm requires 'index'.", ErrorType.Validation, Path: $"{stepPath}.index");
-                            var rmRes = await removeMaskHandler.HandleAsync(new RemoveFigureMaskCommand(addrRes.Value!, mIdx.Value), ct);
+                            var rmRes = await removeMaskHandler.HandleAsync(new RemoveFigureMaskCommand(addrRes.Value!, mIdxRes.Value.Value), ct);
                             return rmRes.IsSuccess ? Result<string?>.Success(rmRes.Value.FigureId) : rmRes.Error!;
+                        }
                         case "clear":
                             var clrRes = await clearMasksHandler.HandleAsync(new ClearFigureMasksCommand(addrRes.Value!), ct);
                             return clrRes.IsSuccess ? Result<string?>.Success(clrRes.Value.FigureId) : clrRes.Error!;
                         default:
-                            return new Error("Cli.InvalidArgs", $"Unsupported batch mask action '{action}'.", ErrorType.Validation, Path: $"{stepPath}.action");
+                            return new Error("Cli.InvalidArgs", $"Unsupported batch mask action '{actionRes.Value}'.", ErrorType.Validation, Path: $"{stepPath}.action");
                     }
                 }
 
@@ -296,16 +418,26 @@ public sealed partial class BatchCliCommand : CliCommand
                 {
                     var addrRes = ResolveInterpolatedString(elem, "addr", stepPath, stepIds, prevId);
                     if (!addrRes.IsSuccess) return addrRes.Error!;
-                    TryGetInt(elem, "page", out var page);
-                    TryGetBool(elem, "all", out bool all);
-                    TryGetString(elem, "out", out var outDir);
-                    TryGetString(elem, "format", out var format);
-                    TryGetInt(elem, "dpi", out var dpi);
-                    TryGetString(elem, "quality", out var quality);
-                    TryGetBool(elem, "overlay", out bool overlay);
+                    var pageRes = ReadOptionalInt(elem, "page", stepPath);
+                    if (!pageRes.IsSuccess) return pageRes.Error!;
+                    var allRes = ReadOptionalBool(elem, "all", stepPath);
+                    if (!allRes.IsSuccess) return allRes.Error!;
+                    var outDirRes = ReadOptionalString(elem, "out", stepPath);
+                    if (!outDirRes.IsSuccess) return outDirRes.Error!;
+                    var formatRes = ReadOptionalString(elem, "format", stepPath);
+                    if (!formatRes.IsSuccess) return formatRes.Error!;
+                    var dpiRes = ReadOptionalInt(elem, "dpi", stepPath);
+                    if (!dpiRes.IsSuccess) return dpiRes.Error!;
+                    var qualityRes = ReadOptionalQuality(elem, "quality", stepPath);
+                    if (!qualityRes.IsSuccess) return qualityRes.Error!;
+                    var overlayRes = ReadOptionalBool(elem, "overlay", stepPath);
+                    if (!overlayRes.IsSuccess) return overlayRes.Error!;
 
                     var res = await renderHandler.HandleAsync(
-                        new RenderPagesCommand(addrRes.Value!, page, all, outDir, format ?? "png", dpi, overlay, quality), ct);
+                        new RenderPagesCommand(
+                            addrRes.Value!, pageRes.Value, allRes.Value,
+                            outDirRes.Value ?? context.GlobalOptions.OutputDirectory,
+                            formatRes.Value ?? "png", dpiRes.Value, overlayRes.Value, qualityRes.Value), ct);
                     return res.IsSuccess ? Result<string?>.Success(res.Value.DocumentId) : res.Error!;
                 }
 
@@ -313,9 +445,11 @@ public sealed partial class BatchCliCommand : CliCommand
                 {
                     var addrRes = ResolveInterpolatedString(elem, "addr", stepPath, stepIds, prevId);
                     if (!addrRes.IsSuccess) return addrRes.Error!;
-                    TryGetBool(elem, "quiet", out bool quiet);
-                    TryGetBool(elem, "verbose", out bool verbose);
-                    var res = await checkHandler.HandleAsync(new LintDocumentQuery(addrRes.Value!, quiet, verbose), ct);
+                    var quietRes = ReadOptionalBool(elem, "quiet", stepPath);
+                    if (!quietRes.IsSuccess) return quietRes.Error!;
+                    var verboseRes = ReadOptionalBool(elem, "verbose", stepPath);
+                    if (!verboseRes.IsSuccess) return verboseRes.Error!;
+                    var res = await checkHandler.HandleAsync(new LintDocumentQuery(addrRes.Value!, quietRes.Value, verboseRes.Value), ct);
                     if (!res.IsSuccess) return res.Error!;
                     if (!res.Value.IsClean)
                         return new Error("Lint.Failed", $"Check failed with {res.Value.ErrorCount} error(s).", ErrorType.Validation, Path: stepPath);
@@ -342,9 +476,12 @@ public sealed partial class BatchCliCommand : CliCommand
             IReadOnlyList<string?> stepIds,
             string? prevId)
         {
-            if (!TryGetString(elem, propName, out var raw) || string.IsNullOrWhiteSpace(raw))
+            var rawRes = ReadOptionalString(elem, propName, stepPath);
+            if (!rawRes.IsSuccess) return rawRes.Error!;
+            if (string.IsNullOrWhiteSpace(rawRes.Value))
                 return new Error("Json.ParseError", $"Missing required '{propName}'.", ErrorType.Validation, Path: $"{stepPath}.{propName}");
 
+            string raw = rawRes.Value;
             string interpolated = RefTokenRegex().Replace(raw, m =>
             {
                 string key = m.Groups[1].Value;
@@ -373,7 +510,7 @@ public sealed partial class BatchCliCommand : CliCommand
                 "extract" => ["op", "addr", "selectors", "out", "format", "dpi", "padding", "quality", "naming", "includeCaption", "maskAll", "maskMatch", "maskStyle", "maskColor", "noMasks", "meta", "keepOverlay", "retainDb", "offline", "manifest", "quiet", "verbose"],
                 "patch" => ["op", "addr", "set"],
                 "add" => ["op", "addr", "page", "bbox", "category", "caption", "label", "num", "index"],
-                "mask" => ["op", "addr", "action", "match", "style", "color", "index"],
+                "mask" => ["op", "addr", "action", "bbox", "label", "match", "style", "color", "index"],
                 "render" => ["op", "addr", "page", "all", "out", "format", "dpi", "quality", "overlay"],
                 "check" => ["op", "addr", "quiet", "verbose"],
                 "rm" => ["op", "addr"],
@@ -413,48 +550,51 @@ public sealed partial class BatchCliCommand : CliCommand
             return true;
         }
 
-        private static bool TryGetString(JsonElement el, string name, out string? value)
+        private static Result<string?> ReadOptionalString(JsonElement el, string name, string stepPath)
         {
-            value = null;
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.String)
-            {
-                value = prop.GetString();
-                return true;
-            }
-            return false;
+            if (!el.TryGetProperty(name, out var prop) || prop.ValueKind == JsonValueKind.Null)
+                return Result<string?>.Success(null);
+            if (prop.ValueKind == JsonValueKind.String)
+                return Result<string?>.Success(prop.GetString());
+            return new Error("Json.ParseError", $"Property '{name}' must be a string.", ErrorType.Validation, Path: $"{stepPath}.{name}");
         }
 
-        private static bool TryGetBool(JsonElement el, string name, out bool value)
+        private static Result<bool> ReadOptionalBool(JsonElement el, string name, string stepPath)
         {
-            value = false;
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind is JsonValueKind.True or JsonValueKind.False)
-            {
-                value = prop.GetBoolean();
-                return true;
-            }
-            return false;
+            if (!el.TryGetProperty(name, out var prop) || prop.ValueKind == JsonValueKind.Null)
+                return Result<bool>.Success(false);
+            if (prop.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                return Result<bool>.Success(prop.GetBoolean());
+            return new Error("Json.ParseError", $"Property '{name}' must be a boolean.", ErrorType.Validation, Path: $"{stepPath}.{name}");
         }
 
-        private static bool TryGetInt(JsonElement el, string name, out int? value)
+        private static Result<int?> ReadOptionalInt(JsonElement el, string name, string stepPath)
         {
-            value = null;
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out int v))
-            {
-                value = v;
-                return true;
-            }
-            return false;
+            if (!el.TryGetProperty(name, out var prop) || prop.ValueKind == JsonValueKind.Null)
+                return Result<int?>.Success(null);
+            if (prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out int v))
+                return Result<int?>.Success(v);
+            return new Error("Json.ParseError", $"Property '{name}' must be an integer.", ErrorType.Validation, Path: $"{stepPath}.{name}");
         }
 
-        private static bool TryGetDouble(JsonElement el, string name, out double? value)
+        private static Result<double?> ReadOptionalDouble(JsonElement el, string name, string stepPath)
         {
-            value = null;
-            if (el.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.Number && prop.TryGetDouble(out double v))
-            {
-                value = v;
-                return true;
-            }
-            return false;
+            if (!el.TryGetProperty(name, out var prop) || prop.ValueKind == JsonValueKind.Null)
+                return Result<double?>.Success(null);
+            if (prop.ValueKind == JsonValueKind.Number && prop.TryGetDouble(out double v))
+                return Result<double?>.Success(v);
+            return new Error("Json.ParseError", $"Property '{name}' must be a number.", ErrorType.Validation, Path: $"{stepPath}.{name}");
+        }
+
+        private static Result<string?> ReadOptionalQuality(JsonElement el, string name, string stepPath)
+        {
+            if (!el.TryGetProperty(name, out var prop) || prop.ValueKind == JsonValueKind.Null)
+                return Result<string?>.Success(null);
+            if (prop.ValueKind == JsonValueKind.String)
+                return Result<string?>.Success(prop.GetString());
+            if (prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out int q))
+                return Result<string?>.Success(q.ToString(CultureInfo.InvariantCulture));
+            return new Error("Json.ParseError", $"Property '{name}' must be a string or integer.", ErrorType.Validation, Path: $"{stepPath}.{name}");
         }
     }
 

@@ -26,7 +26,14 @@ public sealed class ExtractCliCommand : CliCommand
                 "melomg extract Doc_2026... all -o ./assets --manifest",
                 "melomg extract ./paper.pdf 2.1 -o ./assets --quality high",
                 "melomg extract Doc_2026... all -o ./assets --mask-all --mask-style blur"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "format", "dpi", "quality", "padding", "naming",
+                "include-caption", "mask-all", "mask-match", "mask-style", "mask-color",
+                "no-masks", "meta", "manifest", "keep-overlay", "retain-db",
+                "offline", "quiet", "verbose", "confidence"
+            }))
     {
     }
 
@@ -109,7 +116,19 @@ public sealed class ExtractCliCommand : CliCommand
                 {
                     string numTag = string.IsNullOrWhiteSpace(art.FigureNumber) ? $"#f{art.Index}" : $"#{art.FigureNumber}";
                     string maskTag = art.AppliedMasks.Count > 0 ? $", {art.AppliedMasks.Count} mask(s)" : "";
-                    sb.AppendLine($"  {numTag,-8} {art.FigureId} (p{art.PageNumber}, {art.PixelWidth}x{art.PixelHeight}px, {art.FileSizeBytes} B{maskTag}) -> {art.OutputImagePath}");
+                    if (verbose)
+                    {
+                        string catTag = string.IsNullOrWhiteSpace(art.Category) ? "" : $", {art.Category}";
+                        string confTag = art.Confidence > 0 ? $", conf={art.Confidence:F2}" : "";
+                        string capPreview = string.IsNullOrWhiteSpace(art.Caption)
+                            ? ""
+                            : $"  \"{(art.Caption.Length > 80 ? art.Caption[..80] + "..." : art.Caption)}\"";
+                        sb.AppendLine($"  {numTag,-8} {art.FigureId} (p{art.PageNumber}, {art.PixelWidth}x{art.PixelHeight}px, {art.FileSizeBytes} B{catTag}{confTag}{maskTag}) -> {art.OutputImagePath}{capPreview}");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"  {numTag,-8} {art.FigureId} (p{art.PageNumber}, {art.PixelWidth}x{art.PixelHeight}px, {art.FileSizeBytes} B{maskTag}) -> {art.OutputImagePath}");
+                    }
                 }
             }
             if (!string.IsNullOrWhiteSpace(v.ManifestPath))
@@ -138,7 +157,11 @@ public sealed class RenderCliCommand : CliCommand
             [
                 "melomg render Doc_2026... 1 -o ./preview --overlay --dpi 150",
                 "melomg render Doc_2026... all -o ./pages --format jpg --quality high"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "format", "dpi", "quality", "overlay"
+            }))
     {
     }
 
@@ -197,7 +220,8 @@ public sealed class RmCliCommand : CliCommand
             Description: "Deletes a document workspace or figure immediately (non-interactive).",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Diagnostics,
-            Examples: ["melomg rm Doc_2026...#2.1", "melomg rm Doc_2026..."]))
+            Examples: ["melomg rm Doc_2026...#2.1", "melomg rm Doc_2026..."],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 
@@ -228,7 +252,8 @@ public sealed class CheckCliCommand : CliCommand
             Description: "Verifies stored PDF SHA-256 integrity, figure bounds, extracted image headers, and sequence anomalies.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Diagnostics,
-            Examples: ["melomg check Doc_2026...", "melomg check Doc_2026...#2.1 --json"]))
+            Examples: ["melomg check Doc_2026...", "melomg check Doc_2026...#2.1 --json"],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "quiet", "verbose" }))
     {
     }
 
@@ -248,6 +273,8 @@ public sealed class CheckCliCommand : CliCommand
             var report = res.Value;
             var sb = new StringBuilder();
             sb.AppendLine($"Check {report.TargetId}: {(report.IsClean ? "CLEAN" : "FAILED")} ({report.ErrorCount} error(s), {report.WarningCount} warning(s))");
+            if (verbose && report.CheckedFigureCount.HasValue && report.SourcePdfVerified.HasValue)
+                sb.AppendLine($"Checked {report.CheckedFigureCount.Value} figure(s); source PDF verified: {(report.SourcePdfVerified.Value ? "yes" : "no")}");
             foreach (var issue in report.Issues)
                 sb.AppendLine($"  [{issue.Severity}] {issue.Code} ({issue.EntityId}): {issue.Message}");
             if (report.SuspectPages is { Count: > 0 })
@@ -257,9 +284,18 @@ public sealed class CheckCliCommand : CliCommand
             if (!report.IsClean)
             {
                 if (context.GlobalOptions.Json)
-                    CliCommandHelpers.WriteOutput(context, report, formatted);
+                {
+                    var lintErr = Melomg.Domain.Errors.LintErrors.Failed(report.ErrorCount);
+                    var payload = System.Text.Json.JsonSerializer.Serialize(
+                        new CliJsonErrorEnvelope(false, new CliJsonErrorBody(
+                            lintErr.Code, lintErr.Description, lintErr.Type.ToString(), Details: report)),
+                        MelomgCliJsonContext.Default.CliJsonErrorEnvelope);
+                    context.Console.Error.WriteLine(payload);
+                }
                 else
+                {
                     context.Console.Error.WriteLine(formatted);
+                }
                 return ExitCodes.ValidationError;
             }
 
@@ -286,7 +322,8 @@ public sealed class ModelCliCommand : CliCommand
                 "melomg model set ./doclaynet.onnx --confidence 0.40 --iou 0.45",
                 "melomg model threshold 0.35 0.50",
                 "melomg model reset"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "confidence", "iou" }))
     {
     }
 
@@ -306,6 +343,9 @@ public sealed class ModelCliCommand : CliCommand
             {
                 case "info":
                 {
+                    if (context.PositionalArgs.Count != 1)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
+
                     var res = await getInfo.HandleAsync(new GetModelInfoQuery(), context.CancellationToken);
                     if (!res.IsSuccess) return res.ToExitCode(context.Console, context.GlobalOptions.Json);
                     var m = res.Value;
@@ -355,6 +395,9 @@ public sealed class ModelCliCommand : CliCommand
                 }
                 case "reset":
                 {
+                    if (context.PositionalArgs.Count != 1)
+                        return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", $"Usage: {UsageText}", context.GlobalOptions.Json);
+
                     var res = await resetModel.HandleAsync(new ResetModelCommand(), context.CancellationToken);
                     if (!res.IsSuccess) return res.ToExitCode(context.Console, context.GlobalOptions.Json);
                     CliCommandHelpers.WriteOutput(context, res.Value, $"Reset ONNX model to built-in '{res.Value.ModelName}' (conf={res.Value.ConfidenceThreshold:F2}, iou={res.Value.IouThreshold:F2}).");

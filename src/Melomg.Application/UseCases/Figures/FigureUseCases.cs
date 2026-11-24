@@ -138,6 +138,12 @@ public sealed class PatchTargetHandler(AddressResolver resolver, IDocumentWorksp
         if (command.Title is not null)
             return FigureErrors.InvalidAddress(command.Address, "Document 'title' can only be patched on a Doc_<id> address.");
 
+        if (command.Category is null && command.BoundingBox is null && command.Caption is null &&
+            command.Label is null && command.FigureNumber is null && !command.MoveIndex.HasValue)
+        {
+            return new Error("Cli.InvalidArgs", "Specify at least one figure field to patch (--set, --move, or JSON).", ErrorType.Validation);
+        }
+
         var ownerRes = await resolver.ResolveSingleFigureAsync(command.Address, cancellationToken);
         if (!ownerRes.IsSuccess) return ownerRes.Error!;
 

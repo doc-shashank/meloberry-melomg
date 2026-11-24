@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using Melomg.Application.Abstractions;
 using Melomg.Domain.Common;
 using Melomg.Domain.Documents;
@@ -13,7 +14,7 @@ public sealed record OnnxRawDetection(
 /// <summary>
 /// Pure-.NET ONNX protobuf binary inspector, built-in model generator, and tensor layout detector.
 /// </summary>
-public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxModelInspector
+public sealed partial class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxModelInspector
 {
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private static readonly string[] DefaultClasses = ["figure", "diagram", "chart"];
@@ -179,9 +180,10 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
         {
             long irVersion = 0;
             string producerName = string.Empty, inputName = "images", outputName = "detections";
-            int opsetVersion = 0, inputCount = 0, outputCount = 0, inputW = 640, inputH = 640;
+            int opsetVersion = 0, inputCount = 0, outputCount = 0, inputW = 0, inputH = 0;
             bool hasGraph = false;
-            List<string> classes = [];
+            IReadOnlyList<string>? melomgClasses = null;
+            IReadOnlyList<string>? namesClasses = null;
 
             int pos = 0;
             while (pos < data.Length)
@@ -211,7 +213,7 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
                         break;
                     case 14 when wireType == 2:
                         if (!TryReadLengthDelimited(data, ref pos, out var metaBytes)) return ModelErrors.InvalidModelFormat(fullPath, "Truncated metadata_props.");
-                        TryReadMetadataClasses(metaBytes, classes);
+                        TryReadMetadataClasses(metaBytes, ref melomgClasses, ref namesClasses);
                         break;
                     default:
                         if (!SkipField(data, ref pos, wireType))
@@ -224,16 +226,38 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
                 return ModelErrors.InvalidModelFormat(fullPath, $"Invalid ONNX ir_version ({irVersion}).");
             if (!hasGraph || inputCount == 0 || outputCount == 0)
                 return ModelErrors.InvalidModelFormat(fullPath, "ModelProto missing computation graph inputs or outputs.");
-            if (classes.Count == 0) classes = [.. DefaultClasses];
+
+            IReadOnlyList<string>? embeddedClasses = melomgClasses ?? namesClasses;
+            IReadOnlyList<string> classes = embeddedClasses is { Count: > 0 } ? embeddedClasses : [.. DefaultClasses];
+
+            string fileName = Path.GetFileName(fullPath);
+            int fallbackSize = InferInputSizeFromFileName(fileName)
+                ?? (string.Equals(fileName, OnnxModelProfile.PretrainedModelName, StringComparison.OrdinalIgnoreCase)
+                    ? OnnxModelProfile.PretrainedInputSize
+                    : OnnxModelProfile.DefaultInputSize);
+            int resolvedW = inputW > 0 ? inputW : fallbackSize;
+            int resolvedH = inputH > 0 ? inputH : fallbackSize;
 
             return new OnnxModelMetadata(
-                Path.GetFileName(fullPath), fullPath, isBuiltIn, irVersion,
+                fileName, fullPath, isBuiltIn, irVersion,
                 opsetVersion > 0 ? opsetVersion : OnnxModelProfile.DefaultOpsetVersion,
                 string.IsNullOrWhiteSpace(producerName) ? "onnx" : producerName,
-                inputW > 0 ? inputW : 640, inputH > 0 ? inputH : 640, inputName, outputName, classes);
+                resolvedW, resolvedH, inputName, outputName,
+                classes, embeddedClasses);
         }
         catch (Exception ex) { return ModelErrors.InvalidModelFormat(fullPath, ex.Message); }
     }
+
+    private static int? InferInputSizeFromFileName(string fileName)
+    {
+        var match = ImgSizeFileNameRegex().Match(fileName);
+        if (match.Success && int.TryParse(match.Groups[1].Value, out int size) && size >= 32 && size <= 8192)
+            return size;
+        return null;
+    }
+
+    [GeneratedRegex(@"imgsz(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled)]
+    private static partial Regex ImgSizeFileNameRegex();
 
     private static bool TryParseGraphProto(
         ReadOnlySpan<byte> data, ref int inputCount, ref int outputCount,
@@ -337,7 +361,10 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
         return version;
     }
 
-    private static void TryReadMetadataClasses(ReadOnlySpan<byte> data, List<string> classes)
+    private static void TryReadMetadataClasses(
+        ReadOnlySpan<byte> data,
+        ref IReadOnlyList<string>? melomgClasses,
+        ref IReadOnlyList<string>? namesClasses)
     {
         int pos = 0;
         string key = string.Empty, value = string.Empty;
@@ -350,8 +377,10 @@ public sealed class OnnxProtobufEngine(MelomgStorageOptions options) : IOnnxMode
 
         if (NativeOnnxRuntimeSessionHost.TryParseClassNamesEntry(key, value) is { Count: > 0 } parsed)
         {
-            classes.Clear();
-            classes.AddRange(parsed);
+            if (string.Equals(key, "melomg_classes", StringComparison.OrdinalIgnoreCase))
+                melomgClasses = parsed;
+            else if (string.Equals(key, "names", StringComparison.OrdinalIgnoreCase))
+                namesClasses = parsed;
         }
     }
 

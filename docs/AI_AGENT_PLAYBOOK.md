@@ -7,8 +7,9 @@ Minimal-token execution rules for extracting figures/diagrams from PDFs and feed
 1. **Discover lazily**: Run `melomg prime` once. Query `melomg spec <topic...>` only when needed (`melomg spec extract batch`).
 2. **Use Anomaly-Only Visual QA**: Run `melomg ingest <pdf> --retain-db --offline --quiet` and render ONLY `suspectPages` (`melomg render <docId> <p> --overlay`) to audit sequence gaps, duplicates, or unnumbered detections instead of rendering every page.
 3. **Emit Agent Manifests**: Run `melomg extract <docId> all -o ./assets --quality high --manifest --quiet` to produce `assets/manifest.json` (`num`, `page`, `caption`, `confidence`, `path`) ready for direct insertion into `mby` Markdown/JSON.
-4. **One-shot for known numbers**: When you already know the figure number from PDF text, run `melomg extract ./paper.pdf 2.1 -o ./assets --quality high` in a single call with zero workspace clutter.
+4. **One-shot for known numbers**: When you already know the figure number from PDF text, run `melomg extract ./paper.pdf 2.1 -o ./assets --quality high` in a single call with zero workspace clutter (failed one-shot runs—even with `--retain-db`—leave zero orphaned workspaces).
 5. **Default semantic filenames**: Crops save as `fig_2.1.png` (collision-safe) for clean `imagePath` wiring in `mby`.
+6. **Reliable JSON Parsing**: Under `MBY_AGENT=1` / `MELOMG_AGENT=1` or `--json`, `stdout` is guaranteed to contain only a single-line JSON success envelope on exit `0` (including `extract --help --json`); any failure (including `check --json` lint failures) writes the error envelope to `stderr` with `error.details` when applicable.
 
 ## Recipes
 

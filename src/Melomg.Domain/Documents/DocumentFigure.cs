@@ -95,10 +95,16 @@ public sealed class DocumentFigure : IIndexedEntity
         BoundingBox? captionBoundingBox = null, IEnumerable<FigureLabelMask>? labelMasks = null,
         string? vocabPrefix = null, string? figureNumber = null, string? normalizedNumber = null)
     {
-        var (resolvedPrefix, resolvedNum, resolvedNorm, _) = ResolveVocabularyMetadata(
-            vocabPrefix, figureNumber, caption, label);
-        if (!string.IsNullOrWhiteSpace(normalizedNumber))
-            resolvedNorm = FigureNumberNormalizer.NormalizeLookupNumber(normalizedNumber);
+        string? resolvedPrefix = string.IsNullOrWhiteSpace(vocabPrefix) ? null : vocabPrefix.Trim();
+        string? resolvedNum = string.IsNullOrWhiteSpace(figureNumber) ? null : figureNumber.Trim();
+        string? resolvedNorm = !string.IsNullOrWhiteSpace(normalizedNumber)
+            ? FigureNumberNormalizer.NormalizeLookupNumber(normalizedNumber)
+            : (!string.IsNullOrWhiteSpace(resolvedNum)
+                ? FigureNumberNormalizer.NormalizeLookupNumber(resolvedNum)
+                : null);
+
+        if (string.IsNullOrWhiteSpace(resolvedNorm))
+            resolvedNorm = null;
 
         return new(
             id, documentId, index, pageNumber, pageFigureIndex, category, boundingBox, confidence,
@@ -237,7 +243,7 @@ public sealed class DocumentFigure : IIndexedEntity
         string trimmed = figureNumber.Trim();
         string norm = FigureNumberNormalizer.NormalizeLookupNumber(trimmed);
         if (string.IsNullOrWhiteSpace(norm))
-            return FigureErrors.EmptyLabel();
+            return FigureErrors.InvalidFigureNumber(figureNumber);
 
         if (!string.IsNullOrWhiteSpace(vocabPrefix))
             VocabPrefix = vocabPrefix.Trim();

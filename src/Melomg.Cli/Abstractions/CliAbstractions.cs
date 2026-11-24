@@ -90,7 +90,8 @@ public sealed record CommandDescriptor(
     Type HandlerType,
     CommandCategory Category = CommandCategory.Diagnostics,
     string? DetailedNotes = null,
-    IReadOnlyList<string>? Examples = null);
+    IReadOnlyList<string>? Examples = null,
+    IReadOnlySet<string>? AllowedOptions = null);
 
 public abstract class CliCommand
 {

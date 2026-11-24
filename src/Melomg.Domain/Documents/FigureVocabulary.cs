@@ -14,9 +14,13 @@ public sealed record DocumentVocabulary(
 
     public static DocumentVocabulary BuildFrom(
         IEnumerable<DocumentFigure> figures,
+        IReadOnlyList<string>? scannedPrefixes = null) =>
+        BuildFromEntries(figures.Select(f => (f.VocabPrefix, f.NormalizedNumber)), scannedPrefixes);
+
+    public static DocumentVocabulary BuildFromEntries(
+        IEnumerable<(string? Prefix, string? NormalizedNumber)> entries,
         IReadOnlyList<string>? scannedPrefixes = null)
     {
-        var figList = figures.ToList();
         var prefixCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         int numberedCount = 0;
         int unnumberedCount = 0;
@@ -26,18 +30,18 @@ public sealed record DocumentVocabulary(
         bool hasRoman = false;
         bool hasSequential = false;
 
-        foreach (var fig in figList)
+        foreach (var (prefix, normalizedNumber) in entries)
         {
-            if (!string.IsNullOrWhiteSpace(fig.VocabPrefix))
+            if (!string.IsNullOrWhiteSpace(prefix))
             {
-                string p = fig.VocabPrefix.Trim();
+                string p = prefix.Trim();
                 prefixCounts[p] = prefixCounts.GetValueOrDefault(p) + 1;
             }
 
-            if (!string.IsNullOrWhiteSpace(fig.NormalizedNumber))
+            if (!string.IsNullOrWhiteSpace(normalizedNumber))
             {
                 numberedCount++;
-                ClassifyNumberStyle(fig.NormalizedNumber, ref hasHierarchical, ref hasPrefixed, ref hasRoman, ref hasSequential);
+                ClassifyNumberStyle(normalizedNumber, ref hasHierarchical, ref hasPrefixed, ref hasRoman, ref hasSequential);
             }
             else
             {
@@ -91,7 +95,8 @@ public sealed record DocumentVocabulary(
             return;
         }
 
-        if (normalizedNumber.Length >= 2 && char.IsLetter(normalizedNumber[0]) && char.IsDigit(normalizedNumber[1]))
+        if ((normalizedNumber.Length >= 2 && char.IsLetter(normalizedNumber[0]) && char.IsDigit(normalizedNumber[1])) ||
+            (normalizedNumber.Length >= 3 && char.IsLetter(normalizedNumber[0]) && normalizedNumber[1] == '-' && char.IsDigit(normalizedNumber[2])))
         {
             hasPrefixed = true;
             return;
@@ -192,13 +197,14 @@ public static partial class FigureNumberNormalizer
             return string.Empty;
 
         string s = rawInput.Trim();
+        if (s.StartsWith('#'))
+            s = s[1..].TrimStart();
+
         var prefixMatch = LeadingVisualPrefixRegex().Match(s);
         if (prefixMatch.Success)
             s = s[prefixMatch.Length..].TrimStart();
 
         s = s.TrimEnd(':', '.', '-', '–', '—', ' ');
-        if (s.StartsWith('#'))
-            s = s[1..].TrimStart();
 
         // Normalize "2.1(a)" -> "2.1a" and collapse internal spaces around punctuation
         s = SubPanelParenRegex().Replace(s, "$1");

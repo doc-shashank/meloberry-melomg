@@ -26,7 +26,7 @@ public sealed class PrimeCliCommand : CliCommand
           mask <figAddr> <ls|add|auto|rm|clear> Manage label redaction masks
           render <docId> <p|all> [-o dir] [--overlay] Render full page(s) for QA
           rm <addr>                             Delete workspace or figure immediately
-          check <addr> [--quiet]                Verify PDF SHA-256, bounds, image headers, and sequence anomalies
+          check <addr> [--quiet] [--verbose]    Verify PDF SHA-256, bounds, image headers, and sequence anomalies
           batch <file|->                        Run JSON op array ($0.id / $prev.id, e.g. "$0.id#2.1")
           model <info|set|threshold|reset>      Configure ONNX model
           runtime <status|install|uninstall>    Manage AppData ONNX Runtime
@@ -42,7 +42,8 @@ public sealed class PrimeCliCommand : CliCommand
             Usage: "prime",
             Description: "Prints the compact AI-agent grammar card.",
             HandlerType: typeof(Handler),
-            Category: CommandCategory.Discovery))
+            Category: CommandCategory.Discovery,
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 
@@ -124,9 +125,9 @@ public sealed class SpecCliCommand : CliCommand
               { "op": "extract", "addr": "$0.id", "selectors": ["2.1","2.4"], "out"?: "./assets", "format"?: "png", "quality"?: "high", "dpi"?: 240, "naming"?: "number", "manifest"?: true, "quiet"?: false }
               { "op": "patch", "addr": "$0.id#2.1", "set": { "caption"?: "...", "label"?: "...", "num"?: "...", "category"?: "diagram", "bbox"?: [x,y,w,h], "move"?: "1:shift", "title"?: "..." } }
               { "op": "add", "addr": "$0.id", "page": 1, "bbox": [x,y,w,h], "category"?: "diagram", "num"?: "2.5", "caption"?: "...", "label"?: "..." }
-              { "op": "mask", "addr": "$0.id#2.1", "action": "auto"|"ls"|"clear"|"rm", "match"?: "...", "style"?: "blur", "index"?: 1 }
-              { "op": "render", "addr": "$0.id", "page"?: 1, "all"?: false, "out"?: "./qa", "overlay"?: true }
-              { "op": "check", "addr": "$0.id" }
+              { "op": "mask", "addr": "$0.id#2.1", "action": "ls"|"add"|"auto"|"rm"|"clear", "bbox"?: [x,y,w,h], "label"?: "...", "match"?: "...", "style"?: "blur", "color"?: "#RRGGBB", "index"?: 1 }
+              { "op": "render", "addr": "$0.id", "page"?: 1, "all"?: false, "out"?: "./qa", "quality"?: "high"|85, "overlay"?: true }
+              { "op": "check", "addr": "$0.id", "quiet"?: false, "verbose"?: false }
               { "op": "rm", "addr": "$0.id" }
             """),
         ("vocab", "Automatic PDF vocabulary detection and number-only targeting",
@@ -155,7 +156,8 @@ public sealed class SpecCliCommand : CliCommand
             """
             # errors
             Success (exit 0, stdout): {"success":true,"data":{...}}
-            Failure (exit != 0, stderr): {"success":false,"error":{"code":"...","description":"...","type":"...","path":"...","hint":"..."}}
+            Failure (exit != 0, stderr): {"success":false,"error":{"code":"...","description":"...","type":"...","path":"...","hint":"...","details":{...}}}
+            Failed 'check --json' exits 2 with Lint.Failed + full LintReportResponse in error.details (lowercase severity: "warning"|"error") on stderr and empty stdout.
             Codes: 0=Success 1=IO/General 2=Validation/Json/Lint 3=NotFound 4=Conflict(AmbiguousNumber/ProjectExists)
             """)
     ];
@@ -167,7 +169,8 @@ public sealed class SpecCliCommand : CliCommand
             Description: "Prints focused micro-schemas and documentation for extract, patch, mask, batch, vocab, onnx, or errors.",
             HandlerType: typeof(Handler),
             Category: CommandCategory.Discovery,
-            Examples: ["melomg spec", "melomg spec extract vocab"]))
+            Examples: ["melomg spec", "melomg spec extract vocab"],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 
@@ -217,7 +220,8 @@ public sealed class VersionCliCommand : CliCommand
             Usage: "version",
             Description: "Prints melomg CLI version and .NET runtime details.",
             HandlerType: typeof(Handler),
-            Category: CommandCategory.Discovery))
+            Category: CommandCategory.Discovery,
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)))
     {
     }
 

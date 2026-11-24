@@ -80,11 +80,16 @@ public sealed class PdfDocument
     {
         var figureList = figures.ToList();
         IndexedListReorderer.SortInPlace(figureList);
-        return new PdfDocument(
+        for (int i = 0; i < figureList.Count; i++)
+            figureList[i].SetIndexInternal(i + 1);
+
+        var doc = new PdfDocument(
             id, title, sourcePdfPath, storedPdfPath, sha256Hash, workingDirectory, modelName,
             confidenceThreshold, ingestedAtUtc, activeFigureId, mode, retainDatabase,
             pages.OrderBy(p => p.PageNumber).ToList(), figureList,
             scannedVocabPrefixes?.Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).ToList() ?? []);
+        doc.RecalculatePageFigureIndices();
+        return doc;
     }
 
     public void EnableDatabaseRetention() => RetainDatabase = true;
@@ -133,6 +138,19 @@ public sealed class PdfDocument
         RefreshVocabulary();
         ActiveFigureId ??= figure.Id;
         return figure;
+    }
+
+    public Result RefreshDocumentSnapshot(string sha256Hash, IReadOnlyList<PdfPageInfo> pages, DateTimeOffset refreshedAtUtc)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sha256Hash);
+        if (pages.Count == 0)
+            return DocumentErrors.InvalidPdfFormat(StoredPdfPath, "Document contains 0 pages.");
+
+        Sha256Hash = sha256Hash.Trim();
+        IngestedAtUtc = refreshedAtUtc;
+        _pages.Clear();
+        _pages.AddRange(pages.OrderBy(p => p.PageNumber));
+        return Result.Success();
     }
 
     public Result ReplaceDetectedFigures(IEnumerable<DocumentFigure> detectedFigures, string modelName, double confidenceThreshold)
@@ -202,6 +220,9 @@ public sealed class PdfDocument
             .ToList();
         if (exact.Count > 0)
             return (exact, false);
+
+        if (FigureNumberNormalizer.IsPureRoman(norm) || !char.IsDigit(norm[^1]))
+            return ([], false);
 
         var subPanels = _figures
             .Where(f => f.NormalizedNumber is { } fn &&

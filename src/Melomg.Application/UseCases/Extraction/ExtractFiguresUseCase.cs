@@ -90,9 +90,7 @@ internal static class QaOverlayManifestHelper
                     continue;
 
                 bool underWorkspace = dir.StartsWith(workspacePrefix, StringComparison.OrdinalIgnoreCase);
-                string leafName = Path.GetFileName(dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                bool isDedicatedOverlayDir = leafName is "qa_overlay" or "pages";
-                if ((underWorkspace || isDedicatedOverlayDir) && Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
+                if (underWorkspace && Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
                     Directory.Delete(dir, recursive: false);
             }
             catch { }
@@ -191,7 +189,9 @@ public sealed class ExtractFiguresHandler(
         string target = command.Target.Trim();
 
         // One-shot PDF extraction when target is a PDF file path (or not a Doc_/Fig_ address)
-        bool looksLikeIdAddress = target.StartsWith("Doc_", StringComparison.Ordinal) || target.StartsWith("Fig_", StringComparison.Ordinal);
+        bool looksLikeIdAddress = !workingDirectoryProvider.FileExists(target) &&
+                                  !workingDirectoryProvider.DirectoryExists(target) &&
+                                  AddressResolver.LooksLikeEntityIdAddress(target);
         if (!looksLikeIdAddress)
             return await HandleOneShotPdfAsync(target, command, options, cancellationToken);
 
@@ -214,6 +214,14 @@ public sealed class ExtractFiguresHandler(
         }
         else
         {
+            if (command.Selectors is { Count: > 0 })
+            {
+                return new Error(
+                    "Cli.InvalidArgs",
+                    $"Cannot combine extra selectors ({string.Join(", ", command.Selectors)}) with a specific target address '{target}'.",
+                    ErrorType.Validation,
+                    Hint: $"Pass selectors after the document ID instead: melomg extract {document.Id} <selector1> <selector2>");
+            }
             targets = resolved.Figures;
         }
 
@@ -276,14 +284,9 @@ public sealed class ExtractFiguresHandler(
             ? Path.Combine(workingDirectoryProvider.GetCurrentDirectory(), ".meloberry", "melomg", docId)
             : Path.Combine(Path.GetTempPath(), $"melomg_oneshot_{docId}");
 
+        bool persisted = false;
         try
         {
-            if (command.RetainDatabase)
-            {
-                var initRes = await pdfEngine.InitializeWorkspaceAsync(tempWorkspace, cancellationToken);
-                if (!initRes.IsSuccess) return initRes.Error!;
-            }
-
             var docResult = PdfDocument.Create(
                 docId, analysis.SuggestedTitle, fullPdfPath, fullPdfPath, analysis.Sha256Hash, tempWorkspace,
                 analysis.ModelUsed.ModelName, analysis.EffectiveConfidenceThreshold, TimeProvider.System.GetUtcNow(),
@@ -298,6 +301,12 @@ public sealed class ExtractFiguresHandler(
             if (!selRes.IsSuccess) return selRes.Error!;
 
             var targets = selRes.Value;
+            if (command.RetainDatabase)
+            {
+                var initRes = await pdfEngine.InitializeWorkspaceAsync(tempWorkspace, cancellationToken);
+                if (!initRes.IsSuccess) return initRes.Error!;
+            }
+
             string outDir = string.IsNullOrWhiteSpace(command.OutputDirectory)
                 ? (command.RetainDatabase ? Path.Combine(tempWorkspace, "figures") : workingDirectoryProvider.GetCurrentDirectory())
                 : workingDirectoryProvider.NormalizeDirectoryPath(command.OutputDirectory);
@@ -312,6 +321,7 @@ public sealed class ExtractFiguresHandler(
                     targets[i].RecordExtraction(artifacts[i].OutputImagePath);
                 if (targets.Count == 1) document.ActivateFigure(targets[0].Id);
                 await repository.CreateDocumentAsync(document, cancellationToken);
+                persisted = true;
             }
 
             string? manifestPath = null;
@@ -330,7 +340,7 @@ public sealed class ExtractFiguresHandler(
         }
         finally
         {
-            if (!command.RetainDatabase)
+            if (!persisted)
             {
                 try
                 {

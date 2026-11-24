@@ -9,9 +9,13 @@ public sealed record PdfPageInfo(int PageNumber, double WidthPts, double HeightP
     {
         if (pageNumber < 1)
             return DocumentErrors.InvalidPageNumber(pageNumber, Math.Max(1, pageNumber));
-        if (widthPts <= 0 || heightPts <= 0)
-            return FigureErrors.InvalidBoundingBox("Page width and height must be positive.");
+        if (!double.IsFinite(widthPts) || !double.IsFinite(heightPts))
+            return FigureErrors.InvalidBoundingBox("Page width and height must be finite numbers.");
 
-        return new PdfPageInfo(pageNumber, Math.Round(widthPts, 2), Math.Round(heightPts, 2), ((rotationDegrees % 360) + 360) % 360);
+        double rw = Math.Round(widthPts, 2), rh = Math.Round(heightPts, 2);
+        if (rw <= 0 || rh <= 0)
+            return FigureErrors.InvalidBoundingBox("Page width and height must be positive (at least 0.01 pts).");
+
+        return new PdfPageInfo(pageNumber, rw, rh, ((rotationDegrees % 360) + 360) % 360);
     }
 }

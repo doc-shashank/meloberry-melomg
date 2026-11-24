@@ -48,22 +48,31 @@ public sealed class WorkspaceAndLintTests
 
                 var render = scope.ServiceProvider.GetRequiredService<RenderPagesHandler>();
                 var qaOverlayDir = Path.Combine(workDir, "qa_overlay");
+                var internalQaOverlayDir = Path.Combine(res.Value.WorkspaceDirectory, "qa_overlay");
                 var renderKeepRes = await render.HandleAsync(new RenderPagesCommand(docId, 1, false, qaOverlayDir, "png", 100, Overlay: true));
                 Assert.True(renderKeepRes.IsSuccess);
                 string overlayFile = renderKeepRes.Value.Artifacts[0].OutputImagePath;
                 Assert.True(File.Exists(overlayFile));
+
+                var renderInternalRes = await render.HandleAsync(new RenderPagesCommand(docId, 1, false, internalQaOverlayDir, "png", 100, Overlay: true));
+                Assert.True(renderInternalRes.IsSuccess);
+                string internalOverlayFile = renderInternalRes.Value.Artifacts[0].OutputImagePath;
+                Assert.True(File.Exists(internalOverlayFile));
 
                 var extract = scope.ServiceProvider.GetRequiredService<ExtractFiguresHandler>();
                 var extKeep = await extract.HandleAsync(new ExtractFiguresCommand(firstFigId, Format: "png", Dpi: 150, PaddingPx: 8, KeepOverlay: true));
                 Assert.True(extKeep.IsSuccess);
                 Assert.Equal(0, extKeep.Value.CleanedOverlayCount);
                 Assert.True(File.Exists(overlayFile));
+                Assert.True(File.Exists(internalOverlayFile));
 
                 var extRes = await extract.HandleAsync(new ExtractFiguresCommand(firstFigId, Format: "png", Dpi: 150, PaddingPx: 8));
                 Assert.True(extRes.IsSuccess);
-                Assert.Equal(1, extRes.Value.CleanedOverlayCount);
+                Assert.Equal(2, extRes.Value.CleanedOverlayCount);
                 Assert.False(File.Exists(overlayFile));
-                Assert.False(Directory.Exists(qaOverlayDir));
+                Assert.True(Directory.Exists(qaOverlayDir)); // Bug 19: external user directory must not be deleted
+                Assert.False(File.Exists(internalOverlayFile));
+                Assert.False(Directory.Exists(internalQaOverlayDir)); // Workspace-internal empty overlay dir is cleaned up
                 Assert.NotNull(extRes.Value.Artifacts);
                 extractedPng = extRes.Value.Artifacts![0].OutputImagePath;
                 Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(extractedPng)!, "*.meta.json"));

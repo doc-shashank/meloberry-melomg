@@ -24,7 +24,8 @@ public sealed class PatchCliCommand : CliCommand
                 "melomg patch Doc_2026... --set title=\"Cell Biology\"",
                 "melomg patch Doc_2026...#2.1 --set category=diagram --set label=\"Fig. 2.1\"",
                 "melomg patch Doc_2026...#f2 --move 1:shift"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "set", "move" }))
     {
     }
 
@@ -182,7 +183,11 @@ public sealed class AddCliCommand : CliCommand
             [
                 "melomg add Doc_2026... 1 72 120 420 260 --category diagram --num 2.5 --caption \"Fig. 2.5: Pipeline\"",
                 "melomg add Doc_2026... -"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "category", "num", "caption", "label", "index"
+            }))
     {
     }
 
@@ -255,6 +260,9 @@ public sealed class AddCliCommand : CliCommand
             if (!CliCommandHelpers.TryGetIntOption(context, "index", out var optIdx, out int idxOptErr))
                 return idxOptErr;
 
+            if (optIdx.HasValue && pos.Count == 7)
+                return CliResultExtensions.WriteValidationError(context.Console, "Cli.InvalidArgs", "Specify either --index or a 7th positional index, not both.", context.GlobalOptions.Json);
+
             int? index = optIdx;
             if (!index.HasValue && pos.Count == 7 &&
                 !CliCommandHelpers.TryParseOptionalPositiveIndex(pos[6], out index, out int idxErr, context.Console, context.GlobalOptions.Json))
@@ -294,7 +302,11 @@ public sealed class MaskCliCommand : CliCommand
                 "melomg mask Fig_2026... add 120 240 85 18 --label \"Label\" --style blur",
                 "melomg mask Doc_2026...#2.1 rm 1",
                 "melomg mask Doc_2026...#2.1 clear"
-            ]))
+            ],
+            AllowedOptions: new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "label", "style", "color", "match"
+            }))
     {
     }
 

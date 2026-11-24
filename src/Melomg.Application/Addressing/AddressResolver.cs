@@ -64,10 +64,8 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
         if (pageMatch.Success && int.TryParse(pageMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pageNum))
             return new ParsedAddress(AddressKind.Page, addr, docId, null, null, pageNum);
 
-        string rawNum = fragment.StartsWith("n:", StringComparison.OrdinalIgnoreCase) && fragment.Length > 2
-            ? fragment[2..].Trim()
-            : fragment;
-
+        bool hasLiteralPrefix = fragment.StartsWith("n:", StringComparison.OrdinalIgnoreCase);
+        string rawNum = hasLiteralPrefix ? fragment[2..].Trim() : fragment;
         if (string.IsNullOrWhiteSpace(rawNum))
             return FigureErrors.InvalidAddress(addr, "Figure number fragment cannot be empty.");
 
@@ -250,15 +248,17 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
                     continue;
                 }
 
-                string rawNum = tok.StartsWith("n:", StringComparison.OrdinalIgnoreCase) && tok.Length > 2
-                    ? tok[2..].Trim()
-                    : tok;
+                bool isExplicitLiteral = tok.StartsWith("n:", StringComparison.OrdinalIgnoreCase);
+                string rawNum = isExplicitLiteral ? tok[2..].Trim() : tok;
+                if (string.IsNullOrWhiteSpace(rawNum))
+                    return FigureErrors.InvalidAddress(part, "Figure number selector cannot be empty.");
 
                 var (matches, isSubPanel) = doc.FindFiguresByNumber(rawNum);
                 if (matches.Count == 0)
                 {
-                    // Legacy numeric index fallback ONLY if PDF has no figure matching that number AND token is a bare positive integer within range
-                    if (int.TryParse(rawNum, NumberStyles.Integer, CultureInfo.InvariantCulture, out int legacyIdx) &&
+                    if (!isExplicitLiteral &&
+                        doc.Vocabulary.NumberedCount == 0 &&
+                        int.TryParse(rawNum, NumberStyles.Integer, CultureInfo.InvariantCulture, out int legacyIdx) &&
                         legacyIdx >= 1 && legacyIdx <= doc.Figures.Count)
                     {
                         var fallback = doc.FindFigureByIndex(legacyIdx);
@@ -281,6 +281,23 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
 
         return selected.Count > 0 ? selected : FigureErrors.NoFiguresMatch(string.Join(",", selectors));
     }
+
+    public static bool LooksLikeEntityIdAddress(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        string trimmed = value.Trim();
+        if (trimmed.Contains('/') || trimmed.Contains('\\')) return false;
+        int hashIdx = trimmed.IndexOf('#');
+        string idPart = hashIdx >= 0 ? trimmed[..hashIdx] : trimmed;
+        if (idPart.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)) return false;
+        return EntityDocAddressRegex().IsMatch(trimmed) || EntityFigIdRegex().IsMatch(trimmed);
+    }
+
+    [GeneratedRegex(@"^Doc_[A-Za-z0-9_]+(?:#.*)?$", RegexOptions.Compiled)]
+    private static partial Regex EntityDocAddressRegex();
+
+    [GeneratedRegex(@"^Fig_[A-Za-z0-9_]+$", RegexOptions.Compiled)]
+    private static partial Regex EntityFigIdRegex();
 
     [GeneratedRegex(@"^f([1-9]\d*)$", RegexOptions.Compiled)]
     private static partial Regex FigureIndexFragmentRegex();

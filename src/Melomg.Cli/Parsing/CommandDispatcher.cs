@@ -36,7 +36,7 @@ public sealed class CommandDispatcher(
         {
             if (!string.IsNullOrWhiteSpace(verb) && !string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase) && _commands.TryGetValue(verb, out var specific))
             {
-                WriteCommandHelp(console, specific);
+                WriteCommandHelp(console, specific, globals);
                 return ExitCodes.Success;
             }
             return await InvokeRegisteredCommandAsync("prime", [], named, multi, globals, console, cancellationToken);
@@ -46,13 +46,13 @@ public sealed class CommandDispatcher(
         {
             if (positional.Count > 0 && _commands.TryGetValue(positional[0], out var topicCmd))
             {
-                WriteCommandHelp(console, topicCmd);
+                WriteCommandHelp(console, topicCmd, globals);
                 return ExitCodes.Success;
             }
             return await InvokeRegisteredCommandAsync("prime", [], named, multi, globals, console, cancellationToken);
         }
 
-        if (!_commands.TryGetValue(verb, out _))
+        if (!_commands.TryGetValue(verb, out var resolvedCmd))
         {
             return CliResultExtensions.WriteValidationError(
                 console,
@@ -60,6 +60,22 @@ public sealed class CommandDispatcher(
                 $"Unknown command '{verb}'.",
                 globals.Json,
                 hint: "Run 'melomg prime' for supported commands.");
+        }
+
+        if (resolvedCmd.Descriptor.AllowedOptions is { } allowedOptions)
+        {
+            foreach (var optName in named.Keys)
+            {
+                if (!allowedOptions.Contains(optName))
+                {
+                    return CliResultExtensions.WriteValidationError(
+                        console,
+                        "Cli.InvalidOption",
+                        $"Option '--{optName}' is not valid for command '{resolvedCmd.Descriptor.Verb}'.",
+                        globals.Json,
+                        hint: $"Usage: melomg {resolvedCmd.Descriptor.Usage}");
+                }
+            }
         }
 
         return await InvokeRegisteredCommandAsync(verb, positional, named, multi, globals, console, cancellationToken);
@@ -102,9 +118,19 @@ public sealed class CommandDispatcher(
         }
     }
 
-    private static void WriteCommandHelp(IConsole console, CliCommand command)
+    private static void WriteCommandHelp(IConsole console, CliCommand command, GlobalCliOptions globals)
     {
+        if (globals.Silent && !globals.Json) return;
         var d = command.Descriptor;
+        if (globals.Json)
+        {
+            var payload = new CliJsonEnvelope<CommandHelpPayload>(
+                true,
+                new CommandHelpPayload(d.Verb, $"melomg {d.Usage}", d.Description, d.DetailedNotes, d.Examples));
+            console.Out.WriteLine(System.Text.Json.JsonSerializer.Serialize(
+                payload, MelomgCliJsonContext.Default.CliJsonEnvelopeCommandHelpPayload));
+            return;
+        }
         console.Out.WriteLine($"{d.Verb} — {d.Description}");
         console.Out.WriteLine($"Usage: melomg {d.Usage}");
         if (!string.IsNullOrWhiteSpace(d.DetailedNotes))
@@ -205,6 +231,12 @@ public sealed class CommandDispatcher(
                     errorMessage = $"Unknown option '--{opt}'.";
                     return false;
                 }
+            }
+            else if (!endOfOptions && !tokens[i].WasQuoted && val.Length >= 2 && val[0] == '-' && val[1] != '-' && !char.IsDigit(val[1]) && val[1] != '.')
+            {
+                globals = new GlobalCliOptions(silent, json, outputDir, modelPath, appDataDirectory);
+                errorMessage = $"Unknown option '{val}'. Use '--' before literal arguments starting with '-'.";
+                return false;
             }
             else
             {

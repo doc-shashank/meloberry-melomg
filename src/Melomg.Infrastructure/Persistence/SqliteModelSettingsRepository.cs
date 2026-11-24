@@ -26,6 +26,7 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
 
             await using var conn = OpenSettingsConnection();
             await conn.OpenAsync(cancellationToken);
+            await ConfigurePragmasAsync(conn, cancellationToken, enableWal: true);
 
             await using var cmd = conn.CreateCommand();
             cmd.CommandText =
@@ -92,7 +93,16 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    public SqliteConnection OpenSettingsConnection() => new($"Data Source={options.SettingsDbPath};Pooling=False");
+    public SqliteConnection OpenSettingsConnection() =>
+        new($"Data Source={options.SettingsDbPath};Pooling=False;Default Timeout=5");
+
+    internal static async Task ConfigurePragmasAsync(SqliteConnection conn, CancellationToken ct, bool enableWal = true)
+    {
+        string sql = enableWal
+            ? "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;"
+            : "PRAGMA busy_timeout = 5000;";
+        await ExecuteNonQueryAsync(conn, null, sql, ct);
+    }
 
     public async Task<OnnxModelProfile> GetActiveModelProfileAsync(CancellationToken cancellationToken = default)
     {
@@ -100,6 +110,7 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
 
         await using var conn = OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await ConfigurePragmasAsync(conn, cancellationToken, enableWal: false);
 
         await using var cmd = conn.CreateCommand();
         cmd.CommandText =
@@ -129,6 +140,7 @@ public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, 
 
         await using var conn = OpenSettingsConnection();
         await conn.OpenAsync(cancellationToken);
+        await ConfigurePragmasAsync(conn, cancellationToken, enableWal: true);
 
         const string sql =
             """

@@ -158,14 +158,12 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         {
             cancellationToken.ThrowIfCancellationRequested();
             int pageNum = i + 1;
-            var scene = sceneMap.GetOrAdd(pageNum, p =>
-                ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[p - 1], p) is { IsSuccess: true } ok
-                    ? ok.Value
-                    : null!);
-            if (scene is null)
+            if (!sceneMap.TryGetValue(pageNum, out var scene) || scene is null)
             {
                 var sceneResult = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[i], pageNum);
-                return sceneResult.Error!;
+                if (!sceneResult.IsSuccess) return sceneResult.Error!;
+                scene = sceneResult.Value;
+                sceneMap[pageNum] = scene;
             }
 
             scenes.Add(scene);
@@ -210,7 +208,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                         runtimeStatus.RuntimeDirectory,
                         runtimeStatus.InstalledProvider,
                         modelMeta.ModelPath,
-                        modelMeta.SupportedClasses,
+                        modelMeta.EmbeddedClasses,
                         pageBitmap,
                         effectiveConfidence,
                         modelProfile.IouThreshold,
@@ -241,24 +239,13 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 await renderSession.DisposeAsync();
         }
 
-        var candidatePrefixCounts = new Dictionary<string, int>(StringComparer.Ordinal);
-        int numbered = 0, unnumbered = 0;
-        foreach (var c in allCandidates)
-        {
-            if (!string.IsNullOrWhiteSpace(c.VocabPrefix))
-                candidatePrefixCounts[c.VocabPrefix] = candidatePrefixCounts.GetValueOrDefault(c.VocabPrefix) + 1;
-            if (!string.IsNullOrWhiteSpace(c.FigureNumber)) numbered++;
-            else unnumbered++;
-        }
-        var docPrefixes = candidatePrefixCounts.Count > 0
-            ? candidatePrefixCounts.OrderByDescending(kv => kv.Value).Select(kv => kv.Key).ToArray()
-            : scannedPrefixes;
-        var vocab = new DocumentVocabulary(
-            docPrefixes.Length > 0 ? docPrefixes[0] : null,
-            docPrefixes,
-            numbered == 0 ? "none" : (allCandidates.Any(c => c.FigureNumber is not null && (c.FigureNumber.Contains('.') || c.FigureNumber.Contains('-'))) ? "hierarchical" : "sequential"),
-            numbered,
-            unnumbered);
+        var vocab = DocumentVocabulary.BuildFromEntries(
+            allCandidates.Select(c => (
+                c.VocabPrefix,
+                string.IsNullOrWhiteSpace(c.FigureNumber)
+                    ? null
+                    : FigureNumberNormalizer.NormalizeLookupNumber(c.FigureNumber))),
+            scannedPrefixes);
 
         return new PdfIngestionAnalysis(
             docIndex.SuggestedTitle,
@@ -458,6 +445,14 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             regionList.Add((ClampToPage(vec.Box, pageW, pageH), vec.Confidence, vec.SuggestedCategory ?? FigureCategory.Diagram, DetectionSource.Hybrid));
         }
 
+        List<PageCaptionAnchor>? offlineCaptionAnchors = neuralLayout is null
+            ? ExtractPageCaptionAnchors(mergedTextSpans, pageW, pageH)
+            : null;
+
+        bool HasNearbyFigureCaption(BoundingBox box) =>
+            offlineCaptionAnchors is { Count: > 0 } &&
+            offlineCaptionAnchors.Any(a => TryScoreCaptionMatch(box, a, dominantVocabPrefix, out _));
+
         // Only promote heuristic visual-only blobs when real neural ONNX layout inference did not run
         if (neuralLayout is null)
         {
@@ -467,8 +462,14 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                     r.Box.ComputeIoU(vBox) >= 0.20 ||
                     vBox.ComputeContainment(r.Box) >= 0.55 ||
                     r.Box.ComputeContainment(vBox) >= 0.55);
-                if (!covered)
-                    regionList.Add((ClampToPage(vBox, pageW, pageH), 0.78, FigureCategory.Figure, DetectionSource.OnnxModel));
+                if (covered)
+                    continue;
+                if (ComputeTextCoverageRatio(vBox, mergedTextSpans) > 0.35)
+                    continue;
+                if (!HasNearbyFigureCaption(vBox) && !(vBox.Width >= 95 && vBox.Height >= 70))
+                    continue;
+
+                regionList.Add((ClampToPage(vBox, pageW, pageH), 0.78, FigureCategory.Figure, DetectionSource.OnnxModel));
             }
         }
 
@@ -538,6 +539,17 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             else if (det.Confidence >= (neuralLayout is not null ? confidenceThreshold : Math.Max(confidenceThreshold, 0.55)) &&
                      onnxBox.Width >= 32 && onnxBox.Height >= 24)
             {
+                if (neuralLayout is null)
+                {
+                    double textCoverage = ComputeTextCoverageRatio(onnxBox, mergedTextSpans);
+                    if (IsProseCalloutBox(onnxBox, mergedTextSpans) ||
+                        textCoverage > 0.35 ||
+                        (!HasNearbyFigureCaption(onnxBox) && !(onnxBox.Width >= 95 && onnxBox.Height >= 70 && textCoverage <= 0.15)))
+                    {
+                        continue;
+                    }
+                }
+
                 fused.Add((onnxBox, det.Confidence, det.Category, DetectionSource.OnnxModel));
                 for (int i = 0; i < regionList.Count; i++)
                 {
@@ -554,8 +566,21 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 continue;
 
             var r = regionList[i];
-            if (neuralLayout is null || r.Source == DetectionSource.PageLayout || r.Confidence >= 0.80)
-                fused.Add(r);
+            if (neuralLayout is not null)
+            {
+                if (r.Source == DetectionSource.PageLayout || r.Confidence >= 0.80)
+                    fused.Add(r);
+            }
+            else
+            {
+                bool isUnmatchedVectorOrVisual = r.Source != DetectionSource.PageLayout;
+                if (!isUnmatchedVectorOrVisual ||
+                    HasNearbyFigureCaption(r.Box) ||
+                    (r.Confidence >= 0.85 && !IsProseCalloutBox(r.Box, mergedTextSpans) && ComputeTextCoverageRatio(r.Box, mergedTextSpans) <= 0.35))
+                {
+                    fused.Add(r);
+                }
+            }
         }
 
         // 8. NMS + confidence filtering + containment absorption + caption pairing + label expansion + visual rim snap + ordering
@@ -606,10 +631,33 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             if (captionMatch is null && FindNearestNonFigureCaption(trimmedBox, mergedTextSpans, pageW, pageH) is not null)
                 continue;
 
-            if (captionBox is null && neuralCaptionBoxes.Count > 0)
-                captionBox = FindNearestNeuralCaptionBox(trimmedBox, neuralCaptionBoxes);
-            var resolvedCategory = RefineCategoryFromCaption(category, captionMatch);
             var parsedCap = anchor?.Parsed;
+            if (captionBox is null && neuralCaptionBoxes.Count > 0)
+            {
+                captionBox = FindNearestNeuralCaptionBox(trimmedBox, neuralCaptionBoxes);
+                if (captionMatch is null && captionBox is not null)
+                {
+                    var expanded = ExpandRect(captionBox, 4.0);
+                    var overlappingSpans = mergedTextSpans
+                        .Where(s => !string.IsNullOrWhiteSpace(s.Text) &&
+                                    s.Right >= expanded.X && s.X <= expanded.Right &&
+                                    s.Bottom >= expanded.Y && s.Y <= expanded.Bottom)
+                        .OrderBy(s => Math.Round(s.Y / 4.0))
+                        .ThenBy(s => s.X)
+                        .Select(s => s.Text.Trim())
+                        .ToList();
+                    if (overlappingSpans.Count > 0)
+                    {
+                        string joinedCaption = string.Join(' ', overlappingSpans).Trim();
+                        if (FigureNumberNormalizer.TryParseFigureCaption(joinedCaption, out var neuralParsed))
+                        {
+                            captionMatch = joinedCaption;
+                            parsedCap = neuralParsed;
+                        }
+                    }
+                }
+            }
+            var resolvedCategory = RefineCategoryFromCaption(category, captionMatch);
             var label = parsedCap?.ShortLabel ?? $"{resolvedCategory} p{scene.PageInfo.PageNumber}.{localSeq}";
 
             // Strictly carve matched caption out of crop bounds before & after label expansion and visual ink snapping
@@ -634,10 +682,12 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 parsedCap?.Number));
         }
 
-        return AbsorbContainedSubFigures(candidates);
+        return AbsorbContainedSubFigures(candidates, pageW);
     }
 
-    internal static List<DetectedFigureCandidate> AbsorbContainedSubFigures(List<DetectedFigureCandidate> candidates)
+    internal static List<DetectedFigureCandidate> AbsorbContainedSubFigures(
+        List<DetectedFigureCandidate> candidates,
+        double pageWidthPts = 0)
     {
         if (candidates.Count <= 1)
             return candidates;
@@ -677,11 +727,123 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             }
         }
 
-        return candidates
+        var kept = candidates
             .Where((_, idx) => !suppressed.Contains(idx))
-            .OrderBy(c => c.BoundingBox.Y)
-            .ThenBy(c => c.BoundingBox.X)
             .ToList();
+
+        if (kept.Count <= 1)
+            return kept;
+
+        return OrderCandidatesInReadingOrder(kept, pageWidthPts);
+    }
+
+    private static List<DetectedFigureCandidate> OrderCandidatesInReadingOrder(
+        List<DetectedFigureCandidate> kept,
+        double pageWidthPts)
+    {
+        double pageW = pageWidthPts > 0
+            ? pageWidthPts
+            : Math.Max(612.0, kept.Max(c => c.BoundingBox.Right));
+
+        var ordered = new List<DetectedFigureCandidate>(kept.Count);
+        foreach (var pageGroup in kept.GroupBy(c => c.PageNumber).OrderBy(g => g.Key))
+        {
+            var pageItems = pageGroup.ToList();
+            bool hasLeftOnly = pageItems.Any(c => c.BoundingBox.Right < pageW * 0.54);
+            bool hasRightOnly = pageItems.Any(c => c.BoundingBox.X > pageW * 0.46);
+
+            List<DetectedFigureCandidate> pageOrdered;
+            if (hasLeftOnly && hasRightOnly)
+            {
+                var spanning = pageItems
+                    .Where(c => !(c.BoundingBox.Right < pageW * 0.54) && !(c.BoundingBox.X > pageW * 0.46))
+                    .OrderBy(c => c.BoundingBox.Y)
+                    .ThenBy(c => c.BoundingBox.X)
+                    .ToList();
+                var columnItems = pageItems
+                    .Where(c => c.BoundingBox.Right < pageW * 0.54 || c.BoundingBox.X > pageW * 0.46)
+                    .ToList();
+
+                int bandCount = spanning.Count + 1;
+                var leftBands = Enumerable.Range(0, bandCount).Select(_ => new List<DetectedFigureCandidate>()).ToArray();
+                var rightBands = Enumerable.Range(0, bandCount).Select(_ => new List<DetectedFigureCandidate>()).ToArray();
+
+                foreach (var item in columnItems)
+                {
+                    double centerY = item.BoundingBox.Y + item.BoundingBox.Height * 0.5;
+                    int band = 0;
+                    while (band < spanning.Count && centerY >= spanning[band].BoundingBox.Y + spanning[band].BoundingBox.Height * 0.5)
+                        band++;
+
+                    if (item.BoundingBox.Right < pageW * 0.54)
+                        leftBands[band].Add(item);
+                    else
+                        rightBands[band].Add(item);
+                }
+
+                pageOrdered = new List<DetectedFigureCandidate>(pageItems.Count);
+                for (int b = 0; b < bandCount; b++)
+                {
+                    pageOrdered.AddRange(leftBands[b].OrderBy(c => c.BoundingBox.Y).ThenBy(c => c.BoundingBox.X));
+                    pageOrdered.AddRange(rightBands[b].OrderBy(c => c.BoundingBox.Y).ThenBy(c => c.BoundingBox.X));
+                    if (b < spanning.Count)
+                        pageOrdered.Add(spanning[b]);
+                }
+            }
+            else
+            {
+                pageOrdered = pageItems
+                    .OrderBy(c => c.BoundingBox.Y)
+                    .ThenBy(c => c.BoundingBox.X)
+                    .ToList();
+            }
+
+            var seriesSlots = new Dictionary<string, List<(int Slot, int Ordinal, string Norm, DetectedFigureCandidate Candidate)>>(StringComparer.Ordinal);
+            for (int slot = 0; slot < pageOrdered.Count; slot++)
+            {
+                var cand = pageOrdered[slot];
+                string norm = FigureNumberNormalizer.NormalizeLookupNumber(cand.FigureNumber);
+                if (FigureSequenceAnalyzer.TryParseSeriesOrdinal(norm, out var seriesKey, out int ordinal))
+                {
+                    if (!seriesSlots.TryGetValue(seriesKey, out var list))
+                        seriesSlots[seriesKey] = list = [];
+                    list.Add((slot, ordinal, norm, cand));
+                }
+            }
+
+            foreach (var list in seriesSlots.Values)
+            {
+                if (list.Count <= 1) continue;
+                var targetSlots = list.Select(x => x.Slot).OrderBy(s => s).ToList();
+                var sortedCandidates = list
+                    .OrderBy(x => x.Ordinal)
+                    .ThenBy(x => x.Norm, StringComparer.Ordinal)
+                    .ThenBy(x => x.Slot)
+                    .Select(x => x.Candidate)
+                    .ToList();
+                for (int k = 0; k < targetSlots.Count; k++)
+                    pageOrdered[targetSlots[k]] = sortedCandidates[k];
+            }
+
+            ordered.AddRange(pageOrdered);
+        }
+
+        return ordered;
+    }
+
+    private static double ComputeTextCoverageRatio(BoundingBox box, IReadOnlyList<ParsedTextSpan> textSpans)
+    {
+        if (box.Area <= 0) return 0;
+        double textArea = 0;
+        foreach (var s in textSpans)
+        {
+            if (string.IsNullOrWhiteSpace(s.Text)) continue;
+            double ix = Math.Max(0, Math.Min(box.Right, s.Right) - Math.Max(box.X, s.X));
+            double iy = Math.Max(0, Math.Min(box.Bottom, s.Bottom) - Math.Max(box.Y, s.Y));
+            if (ix > 0 && iy > 0)
+                textArea += ix * iy;
+        }
+        return Math.Min(1.0, textArea / box.Area);
     }
 
     private static BoundingBox? FindNearestNeuralCaptionBox(BoundingBox figureBox, IReadOnlyList<BoundingBox> neuralCaptions)
@@ -748,8 +910,21 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 var prev = merged[^1];
                 bool sameLine = Math.Abs(prev.Y - span.Y) <= 4.0;
                 double gap = span.X - (prev.X + prev.Width);
-                double allowedGap = Math.Min(maxGapPts, Math.Max(7.0, Math.Max(prev.FontSize, span.FontSize) * 1.15));
-                if (sameLine && gap >= -12 && gap <= allowedGap)
+                double allowedGap = Math.Min(maxGapPts, Math.Max(5.0, Math.Max(prev.FontSize, span.FontSize) * 0.85));
+                bool isCaptionSameFontContinuation =
+                    IsCaptionText(prev.Text) &&
+                    !IsCaptionText(span.Text) &&
+                    Math.Abs(prev.FontSize - span.FontSize) <= 0.4 &&
+                    !(prev.X < 90 && span.X >= 300) &&
+                    span.X > prev.X + prev.Width * 0.65;
+                double minGap = isCaptionSameFontContinuation
+                    ? -Math.Max(12.0, prev.Width * 0.25)
+                    : -12.0;
+                bool startsNewCaptionAfterText =
+                    IsCaptionText(span.Text) &&
+                    !string.IsNullOrWhiteSpace(prev.Text) &&
+                    prev.Text.Trim().Length > 10;
+                if (sameLine && !startsNewCaptionAfterText && gap >= minGap && gap <= allowedGap)
                 {
                     string sep = (prev.Text.EndsWith(' ') || span.Text.StartsWith(' ') || gap < 1.5) ? "" : " ";
                     string combinedText = prev.Text + sep + span.Text;
@@ -1205,7 +1380,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     // Lazy Byte-Level PDF 1.6 Object Scanner + ObjStm Unpacker + PNG Predictor
     // =========================================================================
 
-    private sealed record PdfObjectEntry(int ObjectNumber, string DictionaryText, int StreamOffset, int StreamLength);
+    private sealed record PdfObjectEntry(int ObjectNumber, string DictionaryText, int StreamOffset, int StreamLength, int FileOffset = 0);
 
     private sealed record PdfDocumentIndex(
         string SuggestedTitle,
@@ -1221,19 +1396,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
         UnpackObjectStreams(pdfBytes, objects);
 
-        string suggestedTitle = Path.GetFileNameWithoutExtension(pdfPath);
-        foreach (var obj in objects.Values)
-        {
-            if (obj.DictionaryText.Contains("/Title", StringComparison.Ordinal))
-            {
-                var titleMatch = TitleRegex().Match(obj.DictionaryText);
-                if (titleMatch.Success && !string.IsNullOrWhiteSpace(titleMatch.Groups[1].Value))
-                {
-                    suggestedTitle = UnescapePdfString(titleMatch.Groups[1].Value).Trim();
-                    break;
-                }
-            }
-        }
+        string suggestedTitle = ExtractDocumentTitle(pdfBytes, objects, Path.GetFileNameWithoutExtension(pdfPath));
 
         double[] defaultMediaBox = [0, 0, 612, 792];
         foreach (var obj in objects.Values)
@@ -1266,6 +1429,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 i++;
                 continue;
             }
+
+            int objStartOffset = i;
 
             // Advance to 'stream' or 'endobj' inside dictionary/non-stream region
             int dictEnd = bodyStart;
@@ -1372,7 +1537,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 i = Math.Min(len, dictEnd + 6);
             }
 
-            objects[objNum] = new PdfObjectEntry(objNum, dictText, streamOffset, streamLength);
+            objects[objNum] = new PdfObjectEntry(objNum, dictText, streamOffset, streamLength, objStartOffset);
         }
 
         return objects;
@@ -1382,6 +1547,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     {
         var objStreams = objects.Values
             .Where(o => o.StreamOffset >= 0 && o.DictionaryText.Contains("/ObjStm", StringComparison.Ordinal))
+            .OrderBy(o => o.FileOffset)
             .ToList();
 
         foreach (var stm in objStreams)
@@ -1423,8 +1589,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                     continue;
 
                 string objText = Encoding.Latin1.GetString(decoded, start, end - start);
-                if (!objects.ContainsKey(entries[k].ObjNum))
-                    objects[entries[k].ObjNum] = new PdfObjectEntry(entries[k].ObjNum, objText, -1, 0);
+                if (!objects.TryGetValue(entries[k].ObjNum, out var existing) || stm.FileOffset > existing.FileOffset)
+                    objects[entries[k].ObjNum] = new PdfObjectEntry(entries[k].ObjNum, objText, -1, 0, stm.FileOffset);
             }
         }
     }
@@ -1453,7 +1619,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         if (!pageInfo.IsSuccess)
             return pageInfo.Error!;
 
-        var resources = ResolvePageResources(pdfBytes, pageObj.DictionaryText, objects);
+        var resources = ResolvePageResources(pdfBytes, pageObjId, objects);
         var contentBytes = CollectPageContentStream(pdfBytes, pageObj.DictionaryText, objects);
         var (placements, vectorShapes, textSpans) = ParsePageContentStream(
             pdfBytes,
@@ -1780,13 +1946,33 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         var singleMatch = Regex.Match(pageDict, @"/Contents\s+(\d+)\s+\d+\s+R\b");
         if (singleMatch.Success &&
             int.TryParse(singleMatch.Groups[1].Value, out int singleId) &&
-            objects.TryGetValue(singleId, out var singleObj) &&
-            singleObj.StreamOffset >= 0 &&
-            singleObj.StreamLength > 0)
+            objects.TryGetValue(singleId, out var singleObj))
         {
-            return DecodeStreamPayload(
-                singleObj.DictionaryText,
-                new ReadOnlySpan<byte>(pdfBytes, singleObj.StreamOffset, singleObj.StreamLength));
+            if (singleObj.StreamOffset >= 0 && singleObj.StreamLength > 0)
+            {
+                return DecodeStreamPayload(
+                    singleObj.DictionaryText,
+                    new ReadOnlySpan<byte>(pdfBytes, singleObj.StreamOffset, singleObj.StreamLength));
+            }
+
+            if (singleObj.DictionaryText.TrimStart().StartsWith('['))
+            {
+                foreach (Match r in IndirectRefRegex().Matches(singleObj.DictionaryText))
+                {
+                    if (int.TryParse(r.Groups[1].Value, out int objId) &&
+                        objects.TryGetValue(objId, out var streamObj) &&
+                        streamObj.StreamOffset >= 0 &&
+                        streamObj.StreamLength > 0)
+                    {
+                        var decoded = DecodeStreamPayload(
+                            streamObj.DictionaryText,
+                            new ReadOnlySpan<byte>(pdfBytes, streamObj.StreamOffset, streamObj.StreamLength));
+                        ms.Write(decoded, 0, decoded.Length);
+                        ms.WriteByte((byte)'\n');
+                    }
+                }
+                return ms.ToArray();
+            }
         }
 
         return [];
@@ -2039,30 +2225,33 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                         break;
                     case "Do" when operands.Count >= 1:
                         string resName = operands[^1];
-                        if (resources.Forms.TryGetValue(resName, out var formObj) && depth < 4 && formObj.StreamOffset >= 0 && formObj.StreamLength > 0)
+                        if (resources.Forms.TryGetValue(resName, out var formObj))
                         {
-                            var formBytes = DecodeStreamPayload(
-                                formObj.DictionaryText,
-                                new ReadOnlySpan<byte>(pdfBytes, formObj.StreamOffset, formObj.StreamLength));
-                            var formCtm = MultiplyMatrix(formObj.Matrix, ctm);
-                            var childRes = MergeFormResources(pdfBytes, formObj.DictionaryText, resources, objects);
-                            ParseContentStreamRecursive(
-                                pdfBytes,
-                                objects,
-                                formBytes,
-                                mbLeft,
-                                mbBottom,
-                                unrotW,
-                                unrotH,
-                                rotationDegrees,
-                                childRes,
-                                formCtm,
-                                depth + 1,
-                                placements,
-                                vectors,
-                                textSpans);
+                            if (depth < 4 && formObj.StreamOffset >= 0 && formObj.StreamLength > 0)
+                            {
+                                var formBytes = DecodeStreamPayload(
+                                    formObj.DictionaryText,
+                                    new ReadOnlySpan<byte>(pdfBytes, formObj.StreamOffset, formObj.StreamLength));
+                                var formCtm = MultiplyMatrix(formObj.Matrix, ctm);
+                                var childRes = MergeFormResources(pdfBytes, formObj.DictionaryText, resources, objects);
+                                ParseContentStreamRecursive(
+                                    pdfBytes,
+                                    objects,
+                                    formBytes,
+                                    mbLeft,
+                                    mbBottom,
+                                    unrotW,
+                                    unrotH,
+                                    rotationDegrees,
+                                    childRes,
+                                    formCtm,
+                                    depth + 1,
+                                    placements,
+                                    vectors,
+                                    textSpans);
+                            }
                         }
-                        else
+                        else if (resources.Images.TryGetValue(resName, out var imgObj))
                         {
                             var corners = new[]
                             {
@@ -2071,12 +2260,11 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                                 TransformPoint(0, 1),
                                 TransformPoint(1, 1)
                             };
-                            double imMinX = corners.Min(c => c.X);
-                            double imMaxX = corners.Max(c => c.X);
-                            double imMinY = corners.Min(c => c.Y);
-                            double imMaxY = corners.Max(c => c.Y);
-                            var imBox = ToTopLeftBox(imMinX, imMinY, imMaxX, imMaxY);
-                            resources.Images.TryGetValue(resName, out var imgObj);
+                            var imBox = ToTopLeftBox(
+                                corners.Min(c => c.X),
+                                corners.Min(c => c.Y),
+                                corners.Max(c => c.X),
+                                corners.Max(c => c.Y));
                             placements.Add(new ParsedImagePlacement(resName, imBox, imgObj));
                         }
                         break;
@@ -2273,12 +2461,42 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             while (i < content.Length && !char.IsWhiteSpace(content[i]) && content[i] is not ('(' or ')' or '[' or ']' or '<' or '>' or '/' or '%'))
                 i++;
             if (i > tokStart)
-                tokens.Add(content[tokStart..i]);
+            {
+                string ident = content[tokStart..i];
+                if (ident == "ID")
+                {
+                    int biIdx = tokens.LastIndexOf("BI");
+                    if (biIdx >= 0 && tokens.Count - biIdx <= 40)
+                    {
+                        if (i < content.Length && char.IsWhiteSpace(content[i])) i++;
+                        int eiPos = FindInlineImageEnd(content, i);
+                        i = eiPos >= 0 ? eiPos + 2 : content.Length;
+                        tokens.RemoveRange(biIdx, tokens.Count - biIdx);
+                        continue;
+                    }
+                }
+                tokens.Add(ident);
+            }
             else
                 i++;
         }
 
         return tokens;
+    }
+
+    private static int FindInlineImageEnd(string content, int start)
+    {
+        for (int p = start; p + 1 < content.Length; p++)
+        {
+            if (content[p] == 'E' && content[p + 1] == 'I' &&
+                (p == start || char.IsWhiteSpace(content[p - 1])) &&
+                (p + 2 >= content.Length || char.IsWhiteSpace(content[p + 2]) ||
+                 content[p + 2] is '/' or '(' or '[' or '<' or '%'))
+            {
+                return p;
+            }
+        }
+        return -1;
     }
 
     private static bool IsPdfOperator(string tok) => tok is
@@ -2420,8 +2638,140 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     [GeneratedRegex(@"/CropBox\s*\[\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\]", RegexOptions.Compiled)]
     private static partial Regex CropBoxRegex();
 
-    [GeneratedRegex(@"/Title\s*\(([^)]*)\)", RegexOptions.Compiled)]
-    private static partial Regex TitleRegex();
+    [GeneratedRegex(@"/Info\s+(\d+)\s+\d+\s+R\b", RegexOptions.Compiled)]
+    private static partial Regex InfoRefRegex();
+
+    [GeneratedRegex(@"/Type\s*/XRef\b", RegexOptions.Compiled)]
+    private static partial Regex XRefTypeRegex();
+
+    [GeneratedRegex(@"(?:/(?:Dest|Next|Prev|First|Last)(?=[\s/<\[(\r\n])|/Type\s*/Outlines\b)", RegexOptions.Compiled)]
+    private static partial Regex OutlineNodeRegex();
+
+    [GeneratedRegex(@"/Title(?=\s*[(<])", RegexOptions.Compiled)]
+    private static partial Regex TitleKeyRegex();
+
+    private static string ExtractDocumentTitle(
+        byte[] pdfBytes,
+        Dictionary<int, PdfObjectEntry> objects,
+        string fallbackTitle)
+    {
+        int tailLen = Math.Min(pdfBytes.Length, 65536);
+        string tailText = Encoding.Latin1.GetString(pdfBytes, pdfBytes.Length - tailLen, tailLen);
+        var tailMatches = InfoRefRegex().Matches(tailText);
+        for (int i = tailMatches.Count - 1; i >= 0; i--)
+        {
+            if (int.TryParse(tailMatches[i].Groups[1].Value, out int infoId) &&
+                objects.TryGetValue(infoId, out var infoObj) &&
+                TryExtractPdfTitleString(infoObj.DictionaryText, out var infoTitle))
+            {
+                return infoTitle;
+            }
+        }
+
+        foreach (var xrefObj in objects.Values
+            .Where(o => XRefTypeRegex().IsMatch(o.DictionaryText))
+            .OrderByDescending(o => o.FileOffset))
+        {
+            var m = InfoRefRegex().Match(xrefObj.DictionaryText);
+            if (m.Success &&
+                int.TryParse(m.Groups[1].Value, out int infoId) &&
+                objects.TryGetValue(infoId, out var infoObj) &&
+                TryExtractPdfTitleString(infoObj.DictionaryText, out var infoTitle))
+            {
+                return infoTitle;
+            }
+        }
+
+        foreach (var obj in objects.Values)
+        {
+            if (!obj.DictionaryText.Contains("/Title", StringComparison.Ordinal))
+                continue;
+            if (OutlineNodeRegex().IsMatch(obj.DictionaryText))
+                continue;
+            if (TryExtractPdfTitleString(obj.DictionaryText, out var title))
+                return title;
+        }
+
+        return fallbackTitle;
+    }
+
+    internal static bool TryExtractPdfTitleString(string dict, out string title)
+    {
+        title = string.Empty;
+        var match = TitleKeyRegex().Match(dict);
+        if (!match.Success)
+            return false;
+
+        int i = match.Index + match.Length;
+        while (i < dict.Length && char.IsWhiteSpace(dict[i]))
+            i++;
+
+        if (i >= dict.Length)
+            return false;
+
+        string decoded;
+        if (dict[i] == '(')
+        {
+            var sb = new StringBuilder();
+            ReadBalancedParenLiteral(dict, ref i, sb);
+            string token = sb.ToString();
+            string inner = token.Length >= 2 && token[0] == '(' && token[^1] == ')'
+                ? token[1..^1]
+                : token.TrimStart('(');
+            string unescaped = UnescapePdfString(inner);
+            decoded = DecodePdfStringBytes(Encoding.Latin1.GetBytes(unescaped));
+        }
+        else if (dict[i] == '<' && (i + 1 >= dict.Length || dict[i + 1] != '<'))
+        {
+            int end = dict.IndexOf('>', i + 1);
+            if (end < 0)
+                return false;
+
+            string rawHex = dict[(i + 1)..end];
+            var hexChars = new StringBuilder(rawHex.Length);
+            foreach (char ch in rawHex)
+            {
+                if (Uri.IsHexDigit(ch))
+                    hexChars.Append(ch);
+            }
+            if (hexChars.Length == 0)
+                return false;
+            if (hexChars.Length % 2 != 0)
+                hexChars.Append('0');
+
+            var bytes = new byte[hexChars.Length / 2];
+            string hexStr = hexChars.ToString();
+            for (int b = 0; b < bytes.Length; b++)
+            {
+                if (!byte.TryParse(hexStr.AsSpan(b * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out bytes[b]))
+                    return false;
+            }
+
+            decoded = DecodePdfStringBytes(bytes);
+        }
+        else
+        {
+            return false;
+        }
+
+        decoded = decoded.Replace("\0", string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(decoded))
+            return false;
+
+        title = decoded;
+        return true;
+    }
+
+    private static string DecodePdfStringBytes(byte[] bytes)
+    {
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        return Encoding.Latin1.GetString(bytes);
+    }
 
     private static void ReadBalancedParenLiteral(string content, ref int i, StringBuilder sb)
     {

@@ -41,6 +41,8 @@ public static class FigureErrors
     public static Error InvalidConfidence(double confidence) => new("Figure.InvalidConfidence", $"Confidence score {confidence:F3} must be within [0.0..1.0].", ErrorType.Validation);
     public static Error EmptyLabel() => new("Figure.EmptyLabel", "Figure label cannot be empty.", ErrorType.Validation);
     public static Error EmptyCaption() => new("Figure.EmptyCaption", "Figure caption cannot be empty.", ErrorType.Validation);
+    public static Error InvalidFigureNumber(string raw) =>
+        new("Figure.InvalidFigureNumber", $"Figure number '{raw}' contains no valid identifier characters.", ErrorType.Validation);
     public static Error InvalidFormat(string format) => new("Figure.InvalidFormat", $"Output image format '{format}' is unsupported. Use 'png' or 'jpg'.", ErrorType.Validation);
     public static Error InvalidDpi(int dpi) => new("Figure.InvalidDpi", $"DPI {dpi} must be within [72..600].", ErrorType.Validation);
     public static Error InvalidPadding(int paddingPx) => new("Figure.InvalidPadding", $"Padding {paddingPx} px must be within [0..100].", ErrorType.Validation);

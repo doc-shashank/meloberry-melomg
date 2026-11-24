@@ -19,7 +19,7 @@ public static partial class FigureSequenceAnalyzer
 {
     public const double DefaultLowConfidenceThreshold = 0.55;
 
-    [GeneratedRegex(@"^(?<series>(?:[A-Za-z]-?|\d+[.\-]))(?<ord>\d+)(?:[a-zA-Z]|\([a-zA-Z0-9]+\))?$", RegexOptions.Compiled)]
+    [GeneratedRegex(@"^(?<series>(?:[A-Za-z]-?|\d+(?:[.\-]\d+)*[.\-]))(?<ord>\d+)(?:[a-zA-Z]|\([a-zA-Z0-9]+\))?$", RegexOptions.Compiled)]
     private static partial Regex HierarchicalSeriesRegex();
 
     [GeneratedRegex(@"^(?<ord>\d+)(?:[a-zA-Z]|\([a-zA-Z0-9]+\))?$", RegexOptions.Compiled)]
@@ -199,7 +199,7 @@ public static partial class FigureSequenceAnalyzer
         return new FigureAnomalyReport(anomalies, finalSuspectPages);
     }
 
-    internal static bool TryParseSeriesOrdinal(string? normalizedNumber, out string seriesKey, out int ordinal)
+    public static bool TryParseSeriesOrdinal(string? normalizedNumber, out string seriesKey, out int ordinal)
     {
         seriesKey = string.Empty;
         ordinal = 0;
