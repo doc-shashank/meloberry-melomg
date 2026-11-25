@@ -77,8 +77,9 @@ public static class CliApplicationRunner
         CancellationToken cancellationToken = default)
     {
         var resolvedAppData = appDataDirectory ?? ExtractAppDataArg(args) ?? CliCommandHelpers.ResolveEnvAppData();
+        var filteredArgs = StripAppDataArg(args);
         using var provider = BuildServiceProvider(resolvedAppData);
-        return await ExecuteWithProviderAsync(args, console, provider, cancellationToken);
+        return await ExecuteWithProviderAsync(filteredArgs, console, provider, cancellationToken);
     }
 
     public static async Task<int> ExecuteWithProviderAsync(
@@ -87,19 +88,20 @@ public static class CliApplicationRunner
         IServiceProvider provider,
         CancellationToken cancellationToken = default)
     {
-        var filteredArgs = StripAppDataArg(args);
         var dispatcher = provider.GetRequiredService<CommandDispatcher>();
-        var tokens = CommandTokenizer.FromArgs(filteredArgs);
+        var tokens = CommandTokenizer.FromArgs(args);
         return await dispatcher.ExecuteAsync(tokens, console, cancellationToken);
     }
 
     private static string? ExtractAppDataArg(string[] args)
     {
-        for (int i = 0; i < args.Length - 1; i++)
+        for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--") break;
             if (string.Equals(args[i], "--app-data", StringComparison.OrdinalIgnoreCase))
-                return args[i + 1];
+                return i + 1 < args.Length ? args[i + 1] : null;
+            if (IsValueTakingOptionToken(args[i]))
+                i++;
         }
         return null;
     }
@@ -120,7 +122,13 @@ public static class CliApplicationRunner
                 continue;
             }
             list.Add(args[i]);
+            if (IsValueTakingOptionToken(args[i]) && i + 1 < args.Length)
+                list.Add(args[++i]);
         }
         return [.. list];
     }
+
+    private static bool IsValueTakingOptionToken(string token) =>
+        string.Equals(token, "-o", StringComparison.Ordinal) ||
+        CommandTokenizer.ValueOptions.Contains(token);
 }

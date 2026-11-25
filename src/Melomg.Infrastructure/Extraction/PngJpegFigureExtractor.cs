@@ -254,9 +254,12 @@ public sealed class PngJpegFigureExtractor(
     {
         try
         {
-            string normBase = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string normTarget = Path.GetFullPath(targetPath);
-            if (normTarget.StartsWith(normBase, StringComparison.OrdinalIgnoreCase))
+            string normBase = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string normTarget = Path.GetFullPath(targetPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.Equals(normBase, normTarget, StringComparison.OrdinalIgnoreCase))
+                return ".";
+            string basePrefix = normBase + Path.DirectorySeparatorChar;
+            if (normTarget.StartsWith(basePrefix, StringComparison.OrdinalIgnoreCase))
                 return Path.GetRelativePath(normBase, normTarget).Replace('\\', '/');
         }
         catch

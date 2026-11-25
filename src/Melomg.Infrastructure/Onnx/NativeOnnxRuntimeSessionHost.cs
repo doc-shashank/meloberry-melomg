@@ -125,7 +125,8 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
     public bool TryRunLayoutDetection(
         string versionDir, string provider, string modelPath, IReadOnlyList<string>? fallbackClasses,
         RenderedRgbBitmap pageBitmap, double confidenceThreshold, double iouThreshold,
-        out NeuralLayoutOutput output, out string activeEngine, out string? errorMessage)
+        out NeuralLayoutOutput output, out string activeEngine, out string? errorMessage,
+        int fallbackInputWidth = 1024, int fallbackInputHeight = 1024)
     {
         output = new NeuralLayoutOutput([], []);
         activeEngine = "managed-fallback";
@@ -143,7 +144,7 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
                 return false;
             }
 
-            var entry = GetOrCreateSession(modelPath, provider, fallbackClasses);
+            var entry = GetOrCreateSession(modelPath, provider, fallbackClasses, fallbackInputWidth, fallbackInputHeight);
             activeEngine = entry.ActiveEngine;
 
             var (tensorData, scale, padX, padY) = LetterboxRgbToNchwFloat(
@@ -173,7 +174,14 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
         }
     }
 
-    public void UnloadAllForUninstall() { lock (_hostGate) UnloadHandlesLocked(); }
+    public void UnloadAllForUninstall()
+    {
+        lock (_hostGate)
+        {
+            if (_disposed) return;
+            UnloadHandlesLocked();
+        }
+    }
 
     public void Dispose()
     {
@@ -183,14 +191,29 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
             _disposed = true;
             UnloadHandlesLocked();
         }
+
+        lock (ResolverGate)
+        {
+            if (ReferenceEquals(s_activeHost, this))
+                s_activeHost = null;
+        }
+
+        _inferenceLock.Dispose();
     }
 
-    private CachedSessionEntry GetOrCreateSession(string modelPath, string requestedProvider, IReadOnlyList<string>? fallbackClasses)
+    private CachedSessionEntry GetOrCreateSession(
+        string modelPath,
+        string requestedProvider,
+        IReadOnlyList<string>? fallbackClasses,
+        int fallbackInputWidth,
+        int fallbackInputHeight)
     {
+        int defaultW = fallbackInputWidth > 0 ? fallbackInputWidth : 1024;
+        int defaultH = fallbackInputHeight > 0 ? fallbackInputHeight : 1024;
         long ticks = File.GetLastWriteTimeUtc(modelPath).Ticks;
         string fullModelPath = Path.GetFullPath(modelPath);
         string fallbackKey = fallbackClasses is { Count: > 0 } ? string.Join(",", fallbackClasses) : string.Empty;
-        string cacheKey = $"{fullModelPath}|{requestedProvider}|{ticks}|{fallbackKey}";
+        string cacheKey = $"{fullModelPath}|{requestedProvider}|{ticks}|{defaultW}x{defaultH}|{fallbackKey}";
 
         if (_sessions.TryGetValue(cacheKey, out var existing))
             return existing;
@@ -203,9 +226,9 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
             var (session, activeEngine) = CreateSessionWithProviderFallback(modelPath, requestedProvider);
             var inputMeta = session.InputMetadata.FirstOrDefault();
             string inputName = string.IsNullOrWhiteSpace(inputMeta.Key) ? "images" : inputMeta.Key;
-            int[] dims = inputMeta.Value?.Dimensions ?? [1, 3, 1024, 1024];
-            int inputH = dims.Length >= 4 && dims[2] > 0 ? dims[2] : 1024;
-            int inputW = dims.Length >= 4 && dims[3] > 0 ? dims[3] : 1024;
+            int[] dims = inputMeta.Value?.Dimensions ?? [1, 3, defaultH, defaultW];
+            int inputH = dims.Length >= 4 && dims[2] > 0 ? dims[2] : defaultH;
+            int inputW = dims.Length >= 4 && dims[3] > 0 ? dims[3] : defaultW;
 
             var embeddedClasses = ExtractClassesFromModelMetadata(session.ModelMetadata.CustomMetadataMap);
             var effectiveClasses = embeddedClasses is { Count: > 0 } ? embeddedClasses : (fallbackClasses is { Count: > 0 } ? fallbackClasses : null);
@@ -418,62 +441,79 @@ public sealed class NativeOnnxRuntimeSessionHost : IDisposable
         var rawCaptions = new List<(BoundingBox Box, double Score)>();
         bool needsNms = false;
 
-        if (dims.Length == 3 && dims[2] == 6 && dims[0] == 1 && customClasses is not { Count: 1 })
+        if (dims.Length == 3 && dims[0] == 1)
         {
-            for (int r = 0; r < dims[1] && (long)r * 6 + 5 < data.Length; r++)
-            {
-                int o = r * 6;
-                float score = data[o + 4];
-                if (score < confidenceThreshold) continue;
-                float x1 = data[o], y1 = data[o + 1], x2 = data[o + 2], y2 = data[o + 3];
-                if (x2 <= 2f && y2 <= 2f && inputW > 32) { x1 *= inputW; x2 *= inputW; y1 *= inputH; y2 *= inputH; }
-                ClassifyAndCollect(x1, y1, x2, y2, score, (int)Math.Round(data[o + 5]), inputW, inputH, scale, padX, padY, origWidth, origHeight, customClasses, rawFigures, rawCaptions);
-            }
-        }
-        else if (dims.Length == 3 && dims[0] == 1 && dims[2] != 6 && dims[1] >= 5 && dims[1] <= 128 &&
-                 (dims[2] > dims[1] || customClasses?.Count == dims[1] - 4))
-        {
-            needsNms = true;
-            int channels = dims[1], anchors = dims[2], numClasses = channels - 4;
-            int maxSafeAnchors = anchors > 0 ? Math.Min(anchors, data.Length / channels) : 0;
+            int expectedClasses = customClasses is { Count: > 0 } ? customClasses.Count : DocStructBenchClasses.Length;
+            bool matchesV8Classes = dims[1] >= 5 && dims[1] - 4 == expectedClasses;
+            bool matchesV5Classes = dims[2] >= 6 && dims[2] - 5 == expectedClasses;
 
-            for (int a = 0; a < maxSafeAnchors; a++)
+            bool isYoloV10 = dims[2] == 6 &&
+                             customClasses is not { Count: 1 } &&
+                             !(matchesV8Classes && !matchesV5Classes);
+
+            bool isTransposedV8 = !isYoloV10 &&
+                                  dims[1] >= 5 && dims[1] <= 128 &&
+                                  ((matchesV8Classes && !matchesV5Classes) ||
+                                   (!matchesV5Classes && dims[2] > dims[1]));
+
+            bool isYoloV5 = !isYoloV10 && !isTransposedV8 && dims[2] >= 6 && dims[2] <= 130;
+
+            if (isYoloV10)
             {
-                int bestCls = 0;
-                float bestProb = 0f;
-                for (int c = 0; c < numClasses; c++)
+                for (int r = 0; r < dims[1] && (long)r * 6 + 5 < data.Length; r++)
                 {
-                    int idx = (4 + c) * anchors + a;
-                    if ((uint)idx >= (uint)data.Length) break;
-                    if (data[idx] > bestProb) { bestProb = data[idx]; bestCls = c; }
+                    int o = r * 6;
+                    float score = data[o + 4];
+                    if (score < confidenceThreshold) continue;
+                    float x1 = data[o], y1 = data[o + 1], x2 = data[o + 2], y2 = data[o + 3];
+                    if (x2 <= 2f && y2 <= 2f && inputW > 32) { x1 *= inputW; x2 *= inputW; y1 *= inputH; y2 *= inputH; }
+                    ClassifyAndCollect(x1, y1, x2, y2, score, (int)Math.Round(data[o + 5]), inputW, inputH, scale, padX, padY, origWidth, origHeight, customClasses, rawFigures, rawCaptions);
                 }
-
-                if (bestProb < confidenceThreshold || 3 * anchors + a >= data.Length) continue;
-                CollectCenterBox(data[a], data[anchors + a], data[2 * anchors + a], data[3 * anchors + a], bestProb, bestCls);
             }
-        }
-        else if (dims.Length == 3 && dims[0] == 1 && dims[2] >= 6 && dims[2] <= 130)
-        {
-            needsNms = true;
-            int rows = dims[1], stride = dims[2], numClasses = stride - 5;
-
-            for (int r = 0; r < rows && (long)r * stride + stride - 1 < data.Length; r++)
+            else if (isTransposedV8)
             {
-                int o = r * stride;
-                float objConf = data[o + 4];
-                if (objConf < 0.01f) continue;
+                needsNms = true;
+                int channels = dims[1], anchors = dims[2], numClasses = channels - 4;
+                int maxSafeAnchors = anchors > 0 ? Math.Min(anchors, data.Length / channels) : 0;
 
-                int bestCls = 0;
-                float bestClsProb = 0f;
-                for (int c = 0; c < numClasses; c++)
+                for (int a = 0; a < maxSafeAnchors; a++)
                 {
-                    float p = data[o + 5 + c];
-                    if (p > bestClsProb) { bestClsProb = p; bestCls = c; }
-                }
+                    int bestCls = 0;
+                    float bestProb = 0f;
+                    for (int c = 0; c < numClasses; c++)
+                    {
+                        int idx = (4 + c) * anchors + a;
+                        if ((uint)idx >= (uint)data.Length) break;
+                        if (data[idx] > bestProb) { bestProb = data[idx]; bestCls = c; }
+                    }
 
-                float score = objConf * bestClsProb;
-                if (score >= confidenceThreshold)
-                    CollectCenterBox(data[o], data[o + 1], data[o + 2], data[o + 3], score, bestCls);
+                    if (bestProb < confidenceThreshold || 3 * anchors + a >= data.Length) continue;
+                    CollectCenterBox(data[a], data[anchors + a], data[2 * anchors + a], data[3 * anchors + a], bestProb, bestCls);
+                }
+            }
+            else if (isYoloV5)
+            {
+                needsNms = true;
+                int rows = dims[1], stride = dims[2], numClasses = stride - 5;
+
+                for (int r = 0; r < rows && (long)r * stride + stride - 1 < data.Length; r++)
+                {
+                    int o = r * stride;
+                    float objConf = data[o + 4];
+                    if (objConf < 0.01f) continue;
+
+                    int bestCls = 0;
+                    float bestClsProb = 0f;
+                    for (int c = 0; c < numClasses; c++)
+                    {
+                        float p = data[o + 5 + c];
+                        if (p > bestClsProb) { bestClsProb = p; bestCls = c; }
+                    }
+
+                    float score = objConf * bestClsProb;
+                    if (score >= confidenceThreshold)
+                        CollectCenterBox(data[o], data[o + 1], data[o + 2], data[o + 3], score, bestCls);
+                }
             }
         }
 

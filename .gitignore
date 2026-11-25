@@ -1,6 +1,7 @@
 # .NET build & publish output
 bin/
 obj/
+outdated_stuff
 *.user
 *.suo
 .vs/

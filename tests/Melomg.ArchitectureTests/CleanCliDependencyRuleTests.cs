@@ -152,7 +152,7 @@ public sealed class CleanCliDependencyRuleTests
 
         string expected = MelomgVersion.Resolve(domainAsm);
         Assert.False(string.IsNullOrWhiteSpace(expected));
-        Assert.Equal("2.2.0", expected);
+        Assert.Equal("2.2.1", expected);
         Assert.Equal(expected, MelomgVersion.Resolve(appAsm));
         Assert.Equal(expected, MelomgVersion.Resolve(infraAsm));
         Assert.Equal(expected, MelomgVersion.Resolve(cliAsm));

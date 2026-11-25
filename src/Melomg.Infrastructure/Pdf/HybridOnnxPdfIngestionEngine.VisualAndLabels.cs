@@ -20,25 +20,19 @@ public sealed partial class HybridOnnxPdfIngestionEngine
             return DocumentErrors.PdfFileNotFound(string.Empty);
 
         string fullPath = Path.GetFullPath(pdfPath.Trim());
-        if (!File.Exists(fullPath))
-            return DocumentErrors.PdfFileNotFound(fullPath);
-
-        byte[] pdfBytes = await File.ReadAllBytesAsync(fullPath, cancellationToken);
-        if (!HasPdfSignature(pdfBytes))
-            return DocumentErrors.InvalidPdfFormat(fullPath, "Missing '%PDF-' magic header.");
-
-        var cachedResult = GetOrBuildCachedIndex(pdfBytes, fullPath);
+        var cachedResult = await GetOrBuildCachedDocumentAsync(fullPath, preloadedBytes: null, cancellationToken);
         if (!cachedResult.IsSuccess)
             return cachedResult.Error!;
 
-        var (docIndex, sceneMap, _, _) = cachedResult.Value;
+        var cachedDoc = cachedResult.Value;
+        var docIndex = cachedDoc.Index;
+        var sceneMap = cachedDoc.Scenes;
         if (pageNumber < 1 || pageNumber > docIndex.OrderedPageIds.Count)
             return DocumentErrors.InvalidPageNumber(pageNumber, docIndex.OrderedPageIds.Count);
 
-        ParsedPageScene? scene;
-        if (!sceneMap.TryGetValue(pageNumber, out scene) || scene is null)
+        if (!sceneMap.TryGetValue(pageNumber, out var scene) || scene is null)
         {
-            var sceneRes = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[pageNumber - 1], pageNumber);
+            var sceneRes = ParseSinglePageScene(cachedDoc.PdfBytes, docIndex, docIndex.OrderedPageIds[pageNumber - 1], pageNumber, fullPath);
             if (!sceneRes.IsSuccess)
                 return sceneRes.Error!;
             scene = sceneRes.Value;
@@ -99,7 +93,10 @@ public sealed partial class HybridOnnxPdfIngestionEngine
 
     internal sealed class PdfToUnicodeMap
     {
+        private static readonly int[] DefaultStrides = [4, 2];
+
         public Dictionary<uint, string> CharMap { get; } = [];
+        public HashSet<int> SourceByteLengths { get; } = [];
 
         public bool TryDecodeHex(string hex, out string text)
         {
@@ -134,8 +131,20 @@ public sealed partial class HybridOnnxPdfIngestionEngine
                 return anyMapped;
             }
 
-            // Try 2-byte glyph codes first (common in Type0 / Identity-H textbook fonts), then 1-byte
-            bool mappedAny = TryAppendWithStride(4) || TryAppendWithStride(2);
+            IEnumerable<int> strides = SourceByteLengths.Count > 0
+                ? SourceByteLengths.OrderByDescending(b => b).Select(b => b * 2)
+                : DefaultStrides;
+
+            bool mappedAny = false;
+            foreach (int stride in strides)
+            {
+                if (TryAppendWithStride(stride))
+                {
+                    mappedAny = true;
+                    break;
+                }
+            }
+
             text = sb.ToString();
             return mappedAny && text.Length > 0;
         }
@@ -358,6 +367,25 @@ public sealed partial class HybridOnnxPdfIngestionEngine
     {
         var map = new PdfToUnicodeMap();
 
+        static int CountHexDigits(string raw)
+        {
+            int count = 0;
+            foreach (char ch in raw)
+                if (Uri.IsHexDigit(ch)) count++;
+            return count;
+        }
+
+        foreach (Match blk in CodeSpaceRangeBlockRegex().Matches(cmapText))
+        {
+            foreach (Match pair in HexPairRegex().Matches(blk.Groups[1].Value))
+            {
+                int hexLen = Math.Max(CountHexDigits(pair.Groups[1].Value), CountHexDigits(pair.Groups[2].Value));
+                int byteLen = hexLen / 2;
+                if (byteLen is >= 1 and <= 4)
+                    map.SourceByteLengths.Add(byteLen);
+            }
+        }
+
         foreach (Match blk in BfCharBlockRegex().Matches(cmapText))
         {
             var body = blk.Groups[1].Value;
@@ -365,6 +393,10 @@ public sealed partial class HybridOnnxPdfIngestionEngine
             {
                 if (uint.TryParse(pair.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint src))
                 {
+                    int byteLen = CountHexDigits(pair.Groups[1].Value) / 2;
+                    if (byteLen is >= 1 and <= 4)
+                        map.SourceByteLengths.Add(byteLen);
+
                     var dst = DecodeUtf16BeHex(pair.Groups[2].Value);
                     if (!string.IsNullOrEmpty(dst))
                         map.CharMap[src] = dst;
@@ -382,6 +414,10 @@ public sealed partial class HybridOnnxPdfIngestionEngine
                 {
                     continue;
                 }
+
+                int byteLen = Math.Max(CountHexDigits(m.Groups[1].Value), CountHexDigits(m.Groups[2].Value)) / 2;
+                if (byteLen is >= 1 and <= 4)
+                    map.SourceByteLengths.Add(byteLen);
 
                 if (m.Groups["arr"].Success)
                 {
@@ -1181,27 +1217,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine
         return true;
     }
 
-    private static (string? CaptionText, BoundingBox? CaptionBox) FindNearestCaptionWithBox(
-        BoundingBox box,
-        IReadOnlyList<ParsedTextSpan> textSpans,
-        double pageW,
-        double pageH,
-        string? dominantVocabPrefix = null)
-    {
-        var anchors = ExtractPageCaptionAnchors(textSpans, pageW, pageH);
-        PageCaptionAnchor? best = null;
-        double bestScore = double.MaxValue;
-        foreach (var a in anchors)
-        {
-            if (TryScoreCaptionMatch(box, a, dominantVocabPrefix, out double score) && score < bestScore)
-            {
-                bestScore = score;
-                best = a;
-            }
-        }
-        return best is null ? (null, null) : (best.Text, best.Box);
-    }
-
     private static string? FindNearestNonFigureCaption(
         BoundingBox box,
         IReadOnlyList<ParsedTextSpan> textSpans,
@@ -1383,6 +1398,9 @@ public sealed partial class HybridOnnxPdfIngestionEngine
 
     [GeneratedRegex(@"/ToUnicode\s+(\d+)\s+\d+\s+R\b", RegexOptions.Compiled)]
     private static partial Regex ToUnicodeRefRegex();
+
+    [GeneratedRegex(@"begincodespacerange\s*(.*?)\s*endcodespacerange", RegexOptions.Singleline | RegexOptions.Compiled)]
+    private static partial Regex CodeSpaceRangeBlockRegex();
 
     [GeneratedRegex(@"beginbfchar\s*(.*?)\s*endbfchar", RegexOptions.Singleline | RegexOptions.Compiled)]
     private static partial Regex BfCharBlockRegex();

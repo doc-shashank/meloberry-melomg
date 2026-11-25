@@ -148,9 +148,14 @@ public static partial class FigureNumberNormalizer
         string rawPrefix = m.Groups["prefix"].Value.Trim();
         string rawNum = m.Groups["num"].Value.Trim();
         string delim = m.Groups["delim"].Value;
-        string rest = m.Groups["rest"].Value.TrimStart();
+        string rawRest = m.Groups["rest"].Value;
+        string rest = rawRest.TrimStart();
 
         if (string.IsNullOrWhiteSpace(rawNum))
+            return false;
+
+        // Reject hyphenated compound prose words like "Figure X-ray diffraction..." or "Figure V-shaped..."
+        if (delim.TrimEnd() is "-" or "–" or "—" && rawRest.Length > 0 && char.IsLower(rawRest[0]))
             return false;
 
         // Roman numerals require an explicit delimiter or capitalized title so words like "Figure I" in prose don't misfire
@@ -172,7 +177,6 @@ public static partial class FigureNumberNormalizer
                 return false;
         }
 
-        // Also reject trailing closing-paren prose when delim captured '.' after ')'? (delim is [:.-–—|], so ')' is always in rest)
         string norm = NormalizeLookupNumber(rawNum);
         if (string.IsNullOrEmpty(norm))
             return false;
@@ -189,6 +193,24 @@ public static partial class FigureNumberNormalizer
             return false;
 
         return NonFigureArtifactRegex().IsMatch(text.TrimStart());
+    }
+
+    public static (string? Prefix, string StrippedNumber) ExtractLeadingPrefix(string? rawInput)
+    {
+        if (string.IsNullOrWhiteSpace(rawInput))
+            return (null, string.Empty);
+
+        string s = rawInput.Trim();
+        if (s.StartsWith('#'))
+            s = s[1..].TrimStart();
+
+        var prefixMatch = LeadingVisualPrefixRegex().Match(s);
+        if (!prefixMatch.Success)
+            return (null, s);
+
+        string prefix = prefixMatch.Value.Trim();
+        string rest = s[prefixMatch.Length..].TrimStart();
+        return (string.IsNullOrWhiteSpace(prefix) ? null : prefix, rest);
     }
 
     public static string NormalizeLookupNumber(string? rawInput)
@@ -235,7 +257,7 @@ public static partial class FigureNumberNormalizer
         !string.IsNullOrWhiteSpace(token) && RomanNumeralRegex().IsMatch(token.Trim());
 
     [GeneratedRegex(
-        @"^(?<prefix>(?:Figures?|Figs?\.?|Diagrams?|Diags?\.?|Charts?|Graphs?|Plots?|Illustrations?|Illus\.?|Plates?|Pl\.?|Schemes?|Maps?|Images?|Imgs?\.?|Pictures?|Pics?\.?|Exhibits?))\s+(?<num>(?:[SA]-?\d+(?:\.\d+)*(?:\([a-zA-Z0-9]+\)|[a-zA-Z])?|\d+(?:[.\-]\d+)*(?:\([a-zA-Z0-9]+\)|[a-zA-Z])?|[IVX]{1,6}))(?<delim>\s*[:.\-–—|])?(?<rest>.*)$",
+        @"^(?<prefix>(?:Figures?|Figs?\.?|Diagrams?|Diags?\.?|Charts?|Graphs?|Plots?|Illustrations?|Illus\.?|Plates?|Pl\.?|Schemes?|Maps?|Images?|Imgs?\.?|Pictures?|Pics?\.?|Exhibits?))\s+(?<num>(?:[SA]-?\d+(?:\.\d+)*(?:\([a-zA-Z0-9]+\)|[a-zA-Z])?|\d+(?:[.\-]\d+)*(?:\([a-zA-Z0-9]+\)|[a-zA-Z])?|(?-i:[IVX]{1,6})))(?<delim>\s*[:.\-–—|])?(?<rest>.*)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline)]
     private static partial Regex VisualCaptionRegex();
 

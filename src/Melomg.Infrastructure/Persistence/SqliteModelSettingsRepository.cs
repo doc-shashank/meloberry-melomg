@@ -10,7 +10,7 @@ namespace Melomg.Infrastructure.Persistence;
 public sealed class SqliteModelSettingsRepository(MelomgStorageOptions options, OnnxProtobufEngine onnxEngine) : IModelSettingsRepository
 {
     private readonly SemaphoreSlim _initLock = new(1, 1);
-    private bool _initialized;
+    private volatile bool _initialized;
 
     public async Task EnsureInitializedAsync(CancellationToken cancellationToken = default)
     {

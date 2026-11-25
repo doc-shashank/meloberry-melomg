@@ -30,15 +30,48 @@ public sealed class CommandDispatcher(
         }
 
         if (showVersion)
+        {
+            if (_commands.TryGetValue("version", out var versionCmd) &&
+                !ValidateAllowedOptions(versionCmd, named, console, globals, out int verOptErr))
+                return verOptErr;
+
             return await InvokeRegisteredCommandAsync("version", [], named, multi, globals, console, cancellationToken);
+        }
 
         if (showHelp)
         {
-            if (!string.IsNullOrWhiteSpace(verb) && !string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase) && _commands.TryGetValue(verb, out var specific))
+            if (!string.IsNullOrWhiteSpace(verb) && !string.Equals(verb, "help", StringComparison.OrdinalIgnoreCase))
             {
+                if (!_commands.TryGetValue(verb, out var specific))
+                {
+                    return CliResultExtensions.WriteValidationError(
+                        console,
+                        "Cli.UnknownCommand",
+                        $"Unknown command '{verb}'.",
+                        globals.Json,
+                        hint: "Run 'melomg prime' for supported commands.");
+                }
+
+                if (!ValidateAllowedOptions(specific, named, console, globals, out int specOptErr))
+                    return specOptErr;
+
                 WriteCommandHelp(console, specific, globals);
                 return ExitCodes.Success;
             }
+
+            if (positional.Count > 0 && _commands.TryGetValue(positional[0], out var helpTopicCmd))
+            {
+                if (!ValidateAllowedOptions(helpTopicCmd, named, console, globals, out int topicOptErr))
+                    return topicOptErr;
+
+                WriteCommandHelp(console, helpTopicCmd, globals);
+                return ExitCodes.Success;
+            }
+
+            if (_commands.TryGetValue("prime", out var primeHelpCmd) &&
+                !ValidateAllowedOptions(primeHelpCmd, named, console, globals, out int primeOptErr))
+                return primeOptErr;
+
             return await InvokeRegisteredCommandAsync("prime", [], named, multi, globals, console, cancellationToken);
         }
 
@@ -46,9 +79,17 @@ public sealed class CommandDispatcher(
         {
             if (positional.Count > 0 && _commands.TryGetValue(positional[0], out var topicCmd))
             {
+                if (!ValidateAllowedOptions(topicCmd, named, console, globals, out int topicOptErr))
+                    return topicOptErr;
+
                 WriteCommandHelp(console, topicCmd, globals);
                 return ExitCodes.Success;
             }
+
+            if (_commands.TryGetValue("prime", out var primeCmd) &&
+                !ValidateAllowedOptions(primeCmd, named, console, globals, out int primeOptErr))
+                return primeOptErr;
+
             return await InvokeRegisteredCommandAsync("prime", [], named, multi, globals, console, cancellationToken);
         }
 
@@ -62,23 +103,38 @@ public sealed class CommandDispatcher(
                 hint: "Run 'melomg prime' for supported commands.");
         }
 
-        if (resolvedCmd.Descriptor.AllowedOptions is { } allowedOptions)
+        if (!ValidateAllowedOptions(resolvedCmd, named, console, globals, out int optErr))
+            return optErr;
+
+        return await InvokeRegisteredCommandAsync(verb, positional, named, multi, globals, console, cancellationToken);
+    }
+
+    private static bool ValidateAllowedOptions(
+        CliCommand targetCommand,
+        IReadOnlyDictionary<string, string?> named,
+        IConsole console,
+        GlobalCliOptions globals,
+        out int errorExitCode)
+    {
+        errorExitCode = ExitCodes.Success;
+        if (targetCommand.Descriptor.AllowedOptions is not { } allowedOptions)
+            return true;
+
+        foreach (var optName in named.Keys)
         {
-            foreach (var optName in named.Keys)
+            if (!allowedOptions.Contains(optName))
             {
-                if (!allowedOptions.Contains(optName))
-                {
-                    return CliResultExtensions.WriteValidationError(
-                        console,
-                        "Cli.InvalidOption",
-                        $"Option '--{optName}' is not valid for command '{resolvedCmd.Descriptor.Verb}'.",
-                        globals.Json,
-                        hint: $"Usage: melomg {resolvedCmd.Descriptor.Usage}");
-                }
+                errorExitCode = CliResultExtensions.WriteValidationError(
+                    console,
+                    "Cli.InvalidOption",
+                    $"Option '--{optName}' is not valid for command '{targetCommand.Descriptor.Verb}'.",
+                    globals.Json,
+                    hint: $"Usage: melomg {targetCommand.Descriptor.Usage}");
+                return false;
             }
         }
 
-        return await InvokeRegisteredCommandAsync(verb, positional, named, multi, globals, console, cancellationToken);
+        return true;
     }
 
     private async Task<int> InvokeRegisteredCommandAsync(
@@ -220,7 +276,6 @@ public sealed class CommandDispatcher(
                 }
                 else if (rawPositionals.Count > 0)
                 {
-                    // Allow dash-prefixed positional literals after verb only if unrecognized flag? No — strict: reject unknown flags before '--'
                     globals = new GlobalCliOptions(silent, json, outputDir, modelPath, appDataDirectory);
                     errorMessage = $"Unknown option '--{opt}'. Use '--' before literal arguments starting with '--'.";
                     return false;

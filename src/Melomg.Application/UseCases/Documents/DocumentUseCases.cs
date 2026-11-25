@@ -191,11 +191,15 @@ public sealed class IngestPdfHandler(
         // 1. Refresh existing workspace by Doc_* ID (only when not an existing file or directory on disk)
         if (!workingDirectoryProvider.FileExists(target) &&
             !workingDirectoryProvider.DirectoryExists(target) &&
-            AddressResolver.LooksLikeEntityIdAddress(target) &&
-            target.StartsWith("Doc_", StringComparison.Ordinal))
+            AddressResolver.LooksLikeEntityIdAddress(target))
         {
-            var lookup = await repository.FindDocumentAsync(target, cancellationToken);
-            if (lookup is null) return DocumentErrors.NotFound(target);
+            var parsedAddr = AddressResolver.Parse(target);
+            if (!parsedAddr.IsSuccess) return parsedAddr.Error!;
+            if (parsedAddr.Value.Kind != AddressKind.Document)
+                return FigureErrors.InvalidAddress(target, "Ingest expects a PDF file path, project directory, or bare Doc_<id> without a figure selector.");
+
+            var lookup = await repository.FindDocumentAsync(parsedAddr.Value.DocumentId!, cancellationToken);
+            if (lookup is null) return DocumentErrors.NotFound(parsedAddr.Value.DocumentId!);
             return await RefreshExistingAsync(lookup, command, cancellationToken);
         }
 
@@ -431,6 +435,9 @@ public sealed class IngestPdfHandler(
             var titleRes = doc.SetTitle(command.Title);
             if (!titleRes.IsSuccess) return titleRes.Error!;
         }
+
+        if (command.RetainDatabase && !doc.RetainDatabase)
+            doc.EnableDatabaseRetention();
 
         await repository.SaveDocumentAsync(doc, cancellationToken);
 

@@ -57,12 +57,20 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
             return FigureErrors.InvalidAddress(addr, "Fragment after '#' cannot be empty.");
 
         var idxMatch = FigureIndexFragmentRegex().Match(fragment);
-        if (idxMatch.Success && int.TryParse(idxMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int figIdx))
+        if (idxMatch.Success)
+        {
+            if (!int.TryParse(idxMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int figIdx) || figIdx < 1)
+                return IndexErrors.OutOfIndexBounds(figIdx, 1, int.MaxValue);
             return new ParsedAddress(AddressKind.FigureIndex, addr, docId, null, null, figIdx);
+        }
 
         var pageMatch = PageFragmentRegex().Match(fragment);
-        if (pageMatch.Success && int.TryParse(pageMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pageNum))
+        if (pageMatch.Success)
+        {
+            if (!int.TryParse(pageMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int pageNum) || pageNum < 1)
+                return FigureErrors.InvalidAddress(addr, "Page selector '#p<n>' must be a positive 1-based page number.");
             return new ParsedAddress(AddressKind.Page, addr, docId, null, null, pageNum);
+        }
 
         bool hasLiteralPrefix = fragment.StartsWith("n:", StringComparison.OrdinalIgnoreCase);
         string rawNum = hasLiteralPrefix ? fragment[2..].Trim() : fragment;
@@ -118,11 +126,15 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
         if (matches.Count == 0)
             return FigureErrors.NumberNotFound(parsed.RawNumber!, doc.Vocabulary, doc.Figures.Select(f => f.FigureNumber ?? string.Empty));
 
-        if (matches.Count > 1 || isSubPanel)
+        if (isSubPanel)
         {
-            var hints = isSubPanel
-                ? matches.Select(m => $"{doc.Id}#{m.FigureNumber ?? $"f{m.Index}"}")
-                : matches.Select(m => $"{doc.Id}#f{m.Index} (p{m.PageNumber})");
+            var hints = matches.Select(m => $"{doc.Id}#{m.FigureNumber ?? $"f{m.Index}"}");
+            return FigureErrors.SubPanelSelectionRequired(parsed.RawNumber!, hints);
+        }
+
+        if (matches.Count > 1)
+        {
+            var hints = matches.Select(m => $"{doc.Id}#f{m.Index} (p{m.PageNumber})");
             return FigureErrors.AmbiguousNumber(parsed.RawNumber!, hints);
         }
 
@@ -226,10 +238,13 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
                 }
 
                 var idxMatch = FigureIndexFragmentRegex().Match(tok);
-                if (idxMatch.Success && int.TryParse(idxMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int figIdx))
+                if (idxMatch.Success)
                 {
-                    if (figIdx < 1 || figIdx > doc.Figures.Count)
+                    if (!int.TryParse(idxMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int figIdx) ||
+                        figIdx < 1 || figIdx > doc.Figures.Count)
+                    {
                         return IndexErrors.OutOfIndexBounds(figIdx, 1, Math.Max(1, doc.Figures.Count));
+                    }
                     var byIdx = doc.FindFigureByIndex(figIdx);
                     if (byIdx is null) return FigureErrors.NotFound($"{doc.Id}#f{figIdx}");
                     AddUnique(byIdx);
@@ -237,8 +252,10 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
                 }
 
                 var pageMatch = PageFragmentRegex().Match(tok);
-                if (pageMatch.Success && int.TryParse(pageMatch.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pageNum))
+                if (pageMatch.Success)
                 {
+                    if (!int.TryParse(pageMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out int pageNum) || pageNum < 1)
+                        return FigureErrors.InvalidAddress(part, "Page selector 'p<n>' must be a positive 1-based page number.");
                     if (doc.GetPage(pageNum) is null)
                         return DocumentErrors.InvalidPageNumber(pageNum, doc.PageCount);
                     var pageFigs = doc.Figures.Where(f => f.PageNumber == pageNum).ToList();
@@ -299,9 +316,9 @@ public sealed partial class AddressResolver(IDocumentWorkspaceRepository reposit
     [GeneratedRegex(@"^Fig_[A-Za-z0-9_]+$", RegexOptions.Compiled)]
     private static partial Regex EntityFigIdRegex();
 
-    [GeneratedRegex(@"^f([1-9]\d*)$", RegexOptions.Compiled)]
+    [GeneratedRegex(@"^f(\d+)$", RegexOptions.Compiled)]
     private static partial Regex FigureIndexFragmentRegex();
 
-    [GeneratedRegex(@"^p([1-9]\d*)$", RegexOptions.Compiled)]
+    [GeneratedRegex(@"^p(\d+)$", RegexOptions.Compiled)]
     private static partial Regex PageFragmentRegex();
 }

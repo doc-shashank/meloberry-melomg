@@ -40,21 +40,51 @@ public sealed partial class OnnxProtobufEngine(MelomgStorageOptions options) : I
 
     public async Task EnsureBuiltInModelExistsAsync(CancellationToken cancellationToken = default)
     {
-        if (File.Exists(options.BuiltInModelPath) &&
-            TryParseOnnxModelProto(await File.ReadAllBytesAsync(options.BuiltInModelPath, cancellationToken), options.BuiltInModelPath, true).IsSuccess)
+        if (await IsValidBuiltInModelOnDiskAsync(cancellationToken))
             return;
 
         await _initLock.WaitAsync(cancellationToken);
         try
         {
-            if (File.Exists(options.BuiltInModelPath) &&
-                TryParseOnnxModelProto(await File.ReadAllBytesAsync(options.BuiltInModelPath, cancellationToken), options.BuiltInModelPath, true).IsSuccess)
+            if (await IsValidBuiltInModelOnDiskAsync(cancellationToken))
                 return;
 
             Directory.CreateDirectory(options.ModelsDirectory);
-            await File.WriteAllBytesAsync(options.BuiltInModelPath, BuildCompactDocLayoutOnnxModel(), cancellationToken);
+            string tempModelPath = Path.Combine(
+                options.ModelsDirectory,
+                $".{Path.GetFileName(options.BuiltInModelPath)}.{Guid.NewGuid():N}.tmp");
+            try
+            {
+                await File.WriteAllBytesAsync(tempModelPath, BuildCompactDocLayoutOnnxModel(), cancellationToken);
+                try
+                {
+                    File.Move(tempModelPath, options.BuiltInModelPath, overwrite: true);
+                }
+                catch (IOException) when (File.Exists(options.BuiltInModelPath))
+                {
+                    // Another concurrent process wrote the built-in model simultaneously.
+                }
+            }
+            finally
+            {
+                try { if (File.Exists(tempModelPath)) File.Delete(tempModelPath); } catch { }
+            }
         }
         finally { _initLock.Release(); }
+    }
+
+    private async Task<bool> IsValidBuiltInModelOnDiskAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!File.Exists(options.BuiltInModelPath)) return false;
+            byte[] existingBytes = await File.ReadAllBytesAsync(options.BuiltInModelPath, cancellationToken);
+            return TryParseOnnxModelProto(existingBytes, options.BuiltInModelPath, true).IsSuccess;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     public IReadOnlyList<OnnxRawDetection> RunLayoutInference(

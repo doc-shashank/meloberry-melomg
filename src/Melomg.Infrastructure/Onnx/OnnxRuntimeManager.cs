@@ -20,7 +20,7 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
     private readonly OnnxProtobufEngine _onnxEngine;
     private readonly NativeOnnxRuntimeSessionHost _sessionHost;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private bool _autoInstallFailedInProcess;
+    private volatile bool _autoInstallFailedInProcess;
 
     public OnnxRuntimeManager(MelomgStorageOptions options, OnnxProtobufEngine onnxEngine, NativeOnnxRuntimeSessionHost sessionHost)
     {
@@ -95,18 +95,30 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
             Directory.CreateDirectory(downloadsDir);
 
             string? backupVersionDir = null, backupManifestPath = null;
-            bool movedIntoTarget = false;
+            bool installSucceeded = false;
 
             void RollbackTarget()
             {
-                if (!movedIntoTarget) return;
                 _sessionHost.UnloadAllForUninstall();
-                TryDeleteFileSilent(_options.RuntimeManifestPath);
-                TryDeleteDirectorySilent(targetVersionDir);
                 if (backupVersionDir is not null && Directory.Exists(backupVersionDir))
+                {
+                    TryDeleteDirectorySilent(targetVersionDir);
                     try { Directory.Move(backupVersionDir, targetVersionDir); } catch { }
+                }
+                else
+                {
+                    TryDeleteDirectorySilent(targetVersionDir);
+                }
+
                 if (backupManifestPath is not null && File.Exists(backupManifestPath))
+                {
+                    TryDeleteFileSilent(_options.RuntimeManifestPath);
                     try { File.Move(backupManifestPath, _options.RuntimeManifestPath, overwrite: true); } catch { }
+                }
+                else
+                {
+                    TryDeleteFileSilent(_options.RuntimeManifestPath);
+                }
             }
 
             try
@@ -152,17 +164,18 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
                 _sessionHost.UnloadAllForUninstall();
                 if (Directory.Exists(targetVersionDir))
                 {
-                    backupVersionDir = $"{targetVersionDir}.bak-{Guid.NewGuid():N}";
-                    Directory.Move(targetVersionDir, backupVersionDir);
+                    string candidateBackupDir = $"{targetVersionDir}.bak-{Guid.NewGuid():N}";
+                    Directory.Move(targetVersionDir, candidateBackupDir);
+                    backupVersionDir = candidateBackupDir;
                 }
                 if (File.Exists(_options.RuntimeManifestPath))
                 {
-                    backupManifestPath = $"{_options.RuntimeManifestPath}.bak-{Guid.NewGuid():N}";
-                    File.Move(_options.RuntimeManifestPath, backupManifestPath, overwrite: true);
+                    string candidateBackupManifest = $"{_options.RuntimeManifestPath}.bak-{Guid.NewGuid():N}";
+                    File.Move(_options.RuntimeManifestPath, candidateBackupManifest, overwrite: true);
+                    backupManifestPath = candidateBackupManifest;
                 }
 
                 Directory.Move(stagingDir, targetVersionDir);
-                movedIntoTarget = true;
 
                 await File.WriteAllTextAsync(
                     _options.RuntimeManifestPath,
@@ -181,6 +194,7 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
                     if (!modelRes.IsSuccess) { RollbackTarget(); return modelRes.Error!; }
                 }
 
+                installSucceeded = true;
                 _autoInstallFailedInProcess = false;
                 return Result<OnnxRuntimeStatus>.Success(ReadCurrentStatusInternal());
             }
@@ -188,8 +202,11 @@ public sealed class OnnxRuntimeManager : IOnnxRuntimeManager
             catch (Exception ex) { RollbackTarget(); return RuntimeErrors.InstallFailed(ex.Message); }
             finally
             {
-                if (backupVersionDir is not null) TryDeleteDirectorySilent(backupVersionDir);
-                if (backupManifestPath is not null) TryDeleteFileSilent(backupManifestPath);
+                if (installSucceeded)
+                {
+                    if (backupVersionDir is not null) TryDeleteDirectorySilent(backupVersionDir);
+                    if (backupManifestPath is not null) TryDeleteFileSilent(backupManifestPath);
+                }
                 TryDeleteDirectorySilent(stagingDir);
             }
         }

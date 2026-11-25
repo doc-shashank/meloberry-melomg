@@ -66,26 +66,58 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     private const int TensorGridHeight = 104;
     private const int MaxDecompressedStreamBytes = 64 * 1024 * 1024;
 
+    private sealed class PdfStreamLimitExceededException(string message) : IOException(message);
+
     private sealed record CachedPdfDocument(
         string FullPath,
+        long FileLength,
+        long LastWriteTimeUtcTicks,
         string Sha256,
+        byte[] PdfBytes,
         PdfDocumentIndex Index,
         ConcurrentDictionary<int, ParsedPageScene> Scenes);
 
     private readonly Lock _sceneCacheLock = new();
     private CachedPdfDocument? _sceneCache;
 
-    private Result<(PdfDocumentIndex Index, ConcurrentDictionary<int, ParsedPageScene> Scenes, string Sha256, bool FromCache)>
-        GetOrBuildCachedIndex(byte[] pdfBytes, string fullPath, string? precomputedSha256 = null)
+    private async Task<Result<CachedPdfDocument>> GetOrBuildCachedDocumentAsync(
+        string fullPath,
+        byte[]? preloadedBytes = null,
+        CancellationToken cancellationToken = default)
     {
-        string sha256 = precomputedSha256 ?? ComputeSha256Hex(pdfBytes);
+        var fi = new FileInfo(fullPath);
+        if (!fi.Exists)
+            return DocumentErrors.PdfFileNotFound(fullPath);
+
+        long fileLength = fi.Length;
+        long lastWriteTicks = fi.LastWriteTimeUtc.Ticks;
+
+        if (preloadedBytes is null)
+        {
+            lock (_sceneCacheLock)
+            {
+                if (_sceneCache is { } cached &&
+                    string.Equals(cached.FullPath, fullPath, StringComparison.OrdinalIgnoreCase) &&
+                    cached.FileLength == fileLength &&
+                    cached.LastWriteTimeUtcTicks == lastWriteTicks)
+                {
+                    return cached;
+                }
+            }
+        }
+
+        byte[] pdfBytes = preloadedBytes ?? await File.ReadAllBytesAsync(fullPath, cancellationToken);
+        if (!HasPdfSignature(pdfBytes))
+            return DocumentErrors.InvalidPdfFormat(fullPath, "Missing '%PDF-' magic header.");
+
+        string sha256 = ComputeSha256Hex(pdfBytes);
         lock (_sceneCacheLock)
         {
             if (_sceneCache is { } cached &&
                 string.Equals(cached.FullPath, fullPath, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(cached.Sha256, sha256, StringComparison.Ordinal))
             {
-                return (cached.Index, cached.Scenes, sha256, true);
+                return cached;
             }
         }
 
@@ -93,11 +125,19 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         if (!indexResult.IsSuccess)
             return indexResult.Error!;
 
-        var scenes = new ConcurrentDictionary<int, ParsedPageScene>();
-        lock (_sceneCacheLock)
-            _sceneCache = new CachedPdfDocument(fullPath, sha256, indexResult.Value, scenes);
+        var entry = new CachedPdfDocument(
+            fullPath,
+            pdfBytes.LongLength,
+            lastWriteTicks,
+            sha256,
+            pdfBytes,
+            indexResult.Value,
+            new ConcurrentDictionary<int, ParsedPageScene>());
 
-        return (indexResult.Value, scenes, sha256, false);
+        lock (_sceneCacheLock)
+            _sceneCache = entry;
+
+        return entry;
     }
 
     public async Task<Result<PdfIngestionAnalysis>> AnalyzePdfAsync(
@@ -127,11 +167,14 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             return modelInspection.Error!;
 
         var modelMeta = modelInspection.Value;
-        var cachedResult = GetOrBuildCachedIndex(pdfBytes, fullPath);
+        var cachedResult = await GetOrBuildCachedDocumentAsync(fullPath, pdfBytes, cancellationToken);
         if (!cachedResult.IsSuccess)
             return cachedResult.Error!;
 
-        var (docIndex, sceneMap, sha256, _) = cachedResult.Value;
+        var cachedDoc = cachedResult.Value;
+        var docIndex = cachedDoc.Index;
+        var sceneMap = cachedDoc.Scenes;
+        string sha256 = cachedDoc.Sha256;
         var allCandidates = new List<DetectedFigureCandidate>();
         var pageInfos = new List<PdfPageInfo>(docIndex.OrderedPageIds.Count);
 
@@ -160,7 +203,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             int pageNum = i + 1;
             if (!sceneMap.TryGetValue(pageNum, out var scene) || scene is null)
             {
-                var sceneResult = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[i], pageNum);
+                var sceneResult = ParseSinglePageScene(pdfBytes, docIndex, docIndex.OrderedPageIds[i], pageNum, fullPath);
                 if (!sceneResult.IsSuccess) return sceneResult.Error!;
                 scene = sceneResult.Value;
                 sceneMap[pageNum] = scene;
@@ -214,7 +257,9 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                         modelProfile.IouThreshold,
                         out var detectedNeural,
                         out var pageEngine,
-                        out _))
+                        out _,
+                        modelMeta.InputWidth,
+                        modelMeta.InputHeight))
                     {
                         neuralLayout = detectedNeural;
                         actualInferenceEngine = pageEngine;
@@ -285,7 +330,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             bytesRead = await fs.ReadAsync(header.AsMemory(0, header.Length), cancellationToken);
         }
 
-        if (!HasPdfSignature(header.AsSpan(0, bytesRead).ToArray()))
+        if (!HasPdfSignature(header.AsSpan(0, bytesRead)))
             return DocumentErrors.InvalidPdfFormat(fullSource, "Missing '%PDF-' magic header.");
 
         var fullProjectDir = Path.GetFullPath(projectDirectory.Trim());
@@ -318,11 +363,15 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         if (string.IsNullOrWhiteSpace(storedPdfPath) || !File.Exists(storedPdfPath))
             return DocumentErrors.PdfFileNotFound(storedPdfPath ?? string.Empty);
 
-        byte[] bytes = await File.ReadAllBytesAsync(storedPdfPath, cancellationToken);
-        if (!HasPdfSignature(bytes))
+        await using var fs = new FileStream(storedPdfPath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 65536, useAsync: true);
+        byte[] header = new byte[1024];
+        int headerRead = await fs.ReadAsync(header.AsMemory(0, header.Length), cancellationToken);
+        if (!HasPdfSignature(header.AsSpan(0, headerRead)))
             return DocumentErrors.InvalidPdfFormat(storedPdfPath, "Stored PDF lacks '%PDF-' header.");
 
-        string actualHash = ComputeSha256Hex(bytes);
+        fs.Position = 0;
+        byte[] hashBytes = await SHA256.HashDataAsync(fs, cancellationToken);
+        string actualHash = Convert.ToHexStringLower(hashBytes);
         if (!string.Equals(actualHash, expectedSha256, StringComparison.OrdinalIgnoreCase))
         {
             string expectedPreview = expectedSha256 is { Length: > 12 }
@@ -503,8 +552,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 BoundingBox addedBox;
                 if (neuralLayout is not null)
                 {
-                    // When neural ONNX & structural PDF region agree closely, prefer tight structural box if IoU is strong,
-                    // or when neural box bleeds up into running header while structural page layout avoids it
                     bool preferCleanStructuralHeader =
                         r.Source == DetectionSource.PageLayout &&
                         onnxBox.Y < 46 &&
@@ -621,6 +668,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         var assigned = AssignCaptionsToPageFigures(ordered, mergedTextSpans, pageW, pageH, dominantVocabPrefix);
 
         var candidates = new List<DetectedFigureCandidate>(assigned.Count);
+        var claimedNeuralCaptionIndices = new HashSet<int>();
         int localSeq = 1;
         foreach (var (trimmedBox, confidence, category, source, anchor) in assigned)
         {
@@ -634,10 +682,10 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             var parsedCap = anchor?.Parsed;
             if (captionBox is null && neuralCaptionBoxes.Count > 0)
             {
-                captionBox = FindNearestNeuralCaptionBox(trimmedBox, neuralCaptionBoxes);
-                if (captionMatch is null && captionBox is not null)
+                var (neuralCapBox, neuralCapIdx) = FindNearestNeuralCaptionBox(trimmedBox, neuralCaptionBoxes, claimedNeuralCaptionIndices);
+                if (captionMatch is null && neuralCapBox is not null)
                 {
-                    var expanded = ExpandRect(captionBox, 4.0);
+                    var expanded = ExpandRect(neuralCapBox, 4.0);
                     var overlappingSpans = mergedTextSpans
                         .Where(s => !string.IsNullOrWhiteSpace(s.Text) &&
                                     s.Right >= expanded.X && s.X <= expanded.Right &&
@@ -649,10 +697,13 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                     if (overlappingSpans.Count > 0)
                     {
                         string joinedCaption = string.Join(' ', overlappingSpans).Trim();
-                        if (FigureNumberNormalizer.TryParseFigureCaption(joinedCaption, out var neuralParsed))
+                        if (!FigureNumberNormalizer.IsNonFigureArtifactCaption(joinedCaption) &&
+                            FigureNumberNormalizer.TryParseFigureCaption(joinedCaption, out var neuralParsed))
                         {
+                            captionBox = neuralCapBox;
                             captionMatch = joinedCaption;
                             parsedCap = neuralParsed;
+                            claimedNeuralCaptionIndices.Add(neuralCapIdx);
                         }
                     }
                 }
@@ -846,12 +897,20 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         return Math.Min(1.0, textArea / box.Area);
     }
 
-    private static BoundingBox? FindNearestNeuralCaptionBox(BoundingBox figureBox, IReadOnlyList<BoundingBox> neuralCaptions)
+    private static (BoundingBox? Box, int Index) FindNearestNeuralCaptionBox(
+        BoundingBox figureBox,
+        IReadOnlyList<BoundingBox> neuralCaptions,
+        HashSet<int> claimedIndices)
     {
         BoundingBox? best = null;
+        int bestIdx = -1;
         double bestDist = 75.0;
-        foreach (var cb in neuralCaptions)
+        for (int i = 0; i < neuralCaptions.Count; i++)
         {
+            if (claimedIndices.Contains(i))
+                continue;
+
+            var cb = neuralCaptions[i];
             double overlapX = Math.Max(0, Math.Min(figureBox.Right, cb.Right) - Math.Max(figureBox.X, cb.X));
             if (overlapX <= 0 && Math.Abs((cb.X + cb.Width * 0.5) - (figureBox.X + figureBox.Width * 0.5)) > figureBox.Width * 0.65)
                 continue;
@@ -866,9 +925,10 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             {
                 bestDist = dist;
                 best = cb;
+                bestIdx = i;
             }
         }
-        return best;
+        return (best, bestIdx);
     }
 
     private sealed record VectorCluster(BoundingBox Box, int ShapeCount, double Confidence, FigureCategory? SuggestedCategory);
@@ -1165,8 +1225,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         var consumedImages = new HashSet<int>();
         var consumedVectors = new HashSet<int>();
 
-        // Connect vector clusters and image placements that sit within 24 pts of each other
-        // (e.g., multi-panel figures with connecting arrows or vector annotations)
         int total = images.Count + vectors.Count;
         if (total == 0)
             return (composites, consumedImages, consumedVectors);
@@ -1236,7 +1294,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         foreach (var cap in textSpans)
         {
             if (!IsCaptionText(cap.Text)) continue;
-            // Skip if a single box already cleanly claims it
             var unconsumedNearby = new List<int>();
             for (int i = 0; i < images.Count; i++)
             {
@@ -1394,22 +1451,39 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         if (objects.Count == 0)
             return DocumentErrors.InvalidPdfFormat(pdfPath, "No indirect PDF objects found.");
 
-        UnpackObjectStreams(pdfBytes, objects);
+        try
+        {
+            UnpackObjectStreams(pdfBytes, objects);
+        }
+        catch (PdfStreamLimitExceededException ex)
+        {
+            return DocumentErrors.InvalidPdfFormat(pdfPath, ex.Message);
+        }
 
         string suggestedTitle = ExtractDocumentTitle(pdfBytes, objects, Path.GetFileNameWithoutExtension(pdfPath));
 
+        int? catalogPagesRootId = ResolveCatalogPagesRootId(pdfBytes, objects);
         double[] defaultMediaBox = [0, 0, 612, 792];
-        foreach (var obj in objects.Values)
+        if (catalogPagesRootId.HasValue &&
+            objects.TryGetValue(catalogPagesRootId.Value, out var catalogPagesObj) &&
+            TryParseMediaBox(catalogPagesObj.DictionaryText, out var catalogRootBox))
         {
-            if (PagesTypeRegex().IsMatch(obj.DictionaryText) &&
-                TryParseMediaBox(obj.DictionaryText, out var rootBox))
+            defaultMediaBox = catalogRootBox;
+        }
+        else
+        {
+            foreach (var obj in objects.Values)
             {
-                defaultMediaBox = rootBox;
-                break;
+                if (PagesTypeRegex().IsMatch(obj.DictionaryText) &&
+                    TryParseMediaBox(obj.DictionaryText, out var rootBox))
+                {
+                    defaultMediaBox = rootBox;
+                    break;
+                }
             }
         }
 
-        var orderedPageIds = ResolvePageOrder(objects);
+        var orderedPageIds = ResolvePageOrder(objects, catalogPagesRootId);
         if (orderedPageIds.Count == 0)
             return DocumentErrors.InvalidPdfFormat(pdfPath, "No /Type /Page definitions found in PDF.");
 
@@ -1479,7 +1553,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 }
 
                 if (MatchesKeywordAt(pdfBytes, dictEnd, "stream"u8) &&
-                    (dictEnd == bodyStart || IsDelimiterOrSpace(pdfBytes[dictEnd - 1])) &&
+                    (dictEnd == bodyStart || IsKeywordBoundaryBefore(pdfBytes[dictEnd - 1])) &&
                     dictEnd + 6 < len && (pdfBytes[dictEnd + 6] == '\r' || pdfBytes[dictEnd + 6] == '\n'))
                 {
                     foundStream = true;
@@ -1487,7 +1561,8 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 }
 
                 if (MatchesKeywordAt(pdfBytes, dictEnd, "endobj"u8) &&
-                    (dictEnd == bodyStart || IsDelimiterOrSpace(pdfBytes[dictEnd - 1])))
+                    (dictEnd == bodyStart || IsKeywordBoundaryBefore(pdfBytes[dictEnd - 1])) &&
+                    (dictEnd + 6 >= len || IsDelimiterOrSpace(pdfBytes[dictEnd + 6])))
                 {
                     break;
                 }
@@ -1599,40 +1674,48 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         byte[] pdfBytes,
         PdfDocumentIndex docIndex,
         int pageObjId,
-        int pageNum)
+        int pageNum,
+        string pdfPath)
     {
-        var objects = docIndex.Objects;
-        var pageObj = objects[pageObjId];
+        try
+        {
+            var objects = docIndex.Objects;
+            var pageObj = objects[pageObjId];
 
-        double[] visibleBox = ResolvePageVisibleBox(pageObjId, objects, docIndex.DefaultMediaBox);
-        double mbLeft = visibleBox[0];
-        double mbBottom = visibleBox[1];
-        double unrotW = Math.Max(1, visibleBox[2] - visibleBox[0]);
-        double unrotH = Math.Max(1, visibleBox[3] - visibleBox[1]);
-        int rotation = ResolvePageRotation(pageObjId, objects);
-        int normRot = ((rotation % 360) + 360) % 360;
-        bool swapAxes = normRot == 90 || normRot == 270;
-        double pageW = swapAxes ? unrotH : unrotW;
-        double pageH = swapAxes ? unrotW : unrotH;
+            double[] visibleBox = ResolvePageVisibleBox(pageObjId, objects, docIndex.DefaultMediaBox);
+            double mbLeft = visibleBox[0];
+            double mbBottom = visibleBox[1];
+            double unrotW = Math.Max(1, visibleBox[2] - visibleBox[0]);
+            double unrotH = Math.Max(1, visibleBox[3] - visibleBox[1]);
+            int rotation = ResolvePageRotation(pageObjId, objects);
+            int normRot = ((rotation % 360) + 360) % 360;
+            bool swapAxes = normRot == 90 || normRot == 270;
+            double pageW = swapAxes ? unrotH : unrotW;
+            double pageH = swapAxes ? unrotW : unrotH;
 
-        var pageInfo = PdfPageInfo.Create(pageNum, pageW, pageH, rotation);
-        if (!pageInfo.IsSuccess)
-            return pageInfo.Error!;
+            var pageInfo = PdfPageInfo.Create(pageNum, pageW, pageH, rotation);
+            if (!pageInfo.IsSuccess)
+                return pageInfo.Error!;
 
-        var resources = ResolvePageResources(pdfBytes, pageObjId, objects);
-        var contentBytes = CollectPageContentStream(pdfBytes, pageObj.DictionaryText, objects);
-        var (placements, vectorShapes, textSpans) = ParsePageContentStream(
-            pdfBytes,
-            objects,
-            contentBytes,
-            mbLeft,
-            mbBottom,
-            unrotW,
-            unrotH,
-            normRot,
-            resources);
+            var resources = ResolvePageResources(pdfBytes, pageObjId, objects);
+            var contentBytes = CollectPageContentStream(pdfBytes, pageObj.DictionaryText, objects);
+            var (placements, vectorShapes, textSpans) = ParsePageContentStream(
+                pdfBytes,
+                objects,
+                contentBytes,
+                mbLeft,
+                mbBottom,
+                unrotW,
+                unrotH,
+                normRot,
+                resources);
 
-        return new ParsedPageScene(pageInfo.Value, placements, vectorShapes, textSpans);
+            return new ParsedPageScene(pageInfo.Value, placements, vectorShapes, textSpans);
+        }
+        catch (PdfStreamLimitExceededException ex)
+        {
+            return DocumentErrors.InvalidPdfFormat(pdfPath, ex.Message);
+        }
     }
 
     private static byte[] DecodeStreamPayload(string dictText, ReadOnlySpan<byte> raw)
@@ -1660,7 +1743,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
     private static byte[] DecompressFlate(byte[] raw)
     {
-        return TryDecompress(raw, zlib: true) ?? TryDecompress(raw, zlib: false) ?? raw;
+        return TryDecompress(raw, zlib: true) ?? TryDecompress(raw, zlib: false) ?? [];
 
         static byte[]? TryDecompress(byte[] inputBytes, bool zlib)
         {
@@ -1677,11 +1760,15 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                 while ((read = decoder.Read(buffer, 0, buffer.Length)) > 0)
                 {
                     if (total + read > MaxDecompressedStreamBytes)
-                        throw new InvalidDataException($"Decompressed PDF stream exceeds {MaxDecompressedStreamBytes} bytes limit.");
+                        throw new PdfStreamLimitExceededException($"Decompressed PDF stream exceeds {MaxDecompressedStreamBytes} bytes limit.");
                     output.Write(buffer, 0, read);
                     total += read;
                 }
                 return output.ToArray();
+            }
+            catch (PdfStreamLimitExceededException)
+            {
+                throw;
             }
             catch
             {
@@ -1803,8 +1890,11 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
     private static bool IsSpaceByte(byte b) => b is (byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n';
 
+    private static bool IsKeywordBoundaryBefore(byte b) =>
+        IsSpaceByte(b) || b is (byte)'>' or (byte)'<' or (byte)'[' or (byte)']' or (byte)')' or (byte)'(';
+
     private static bool IsDelimiterOrSpace(byte b) =>
-        IsSpaceByte(b) || b is (byte)'>' or (byte)'<' or (byte)'[' or (byte)']' or (byte)'/' or (byte)')' or (byte)'(';
+        IsKeywordBoundaryBefore(b) || b == (byte)'/';
 
     private static bool MatchesKeywordAt(byte[] data, int pos, ReadOnlySpan<byte> keyword)
     {
@@ -1823,7 +1913,58 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
         return -1;
     }
 
-    private static List<int> ResolvePageOrder(Dictionary<int, PdfObjectEntry> objects)
+    private static int? ResolveCatalogPagesRootId(byte[] pdfBytes, Dictionary<int, PdfObjectEntry> objects)
+    {
+        int? catalogId = null;
+
+        int tailLen = Math.Min(pdfBytes.Length, 65536);
+        string tailText = Encoding.Latin1.GetString(pdfBytes, pdfBytes.Length - tailLen, tailLen);
+        var tailRoots = RootRefRegex().Matches(tailText);
+        for (int i = tailRoots.Count - 1; i >= 0; i--)
+        {
+            if (int.TryParse(tailRoots[i].Groups[1].Value, out int parsedRoot) && objects.ContainsKey(parsedRoot))
+            {
+                catalogId = parsedRoot;
+                break;
+            }
+        }
+
+        if (!catalogId.HasValue)
+        {
+            foreach (var xrefObj in objects.Values
+                .Where(o => XRefTypeRegex().IsMatch(o.DictionaryText))
+                .OrderByDescending(o => o.FileOffset))
+            {
+                var m = RootRefRegex().Match(xrefObj.DictionaryText);
+                if (m.Success && int.TryParse(m.Groups[1].Value, out int parsedRoot) && objects.ContainsKey(parsedRoot))
+                {
+                    catalogId = parsedRoot;
+                    break;
+                }
+            }
+        }
+
+        if (!catalogId.HasValue)
+        {
+            var catObj = objects.Values
+                .Where(o => CatalogTypeRegex().IsMatch(o.DictionaryText))
+                .OrderByDescending(o => o.FileOffset)
+                .FirstOrDefault();
+            if (catObj is not null)
+                catalogId = catObj.ObjectNumber;
+        }
+
+        if (catalogId.HasValue && objects.TryGetValue(catalogId.Value, out var catalog))
+        {
+            var pagesMatch = PagesRefRegex().Match(catalog.DictionaryText);
+            if (pagesMatch.Success && int.TryParse(pagesMatch.Groups[1].Value, out int pagesRootId) && objects.ContainsKey(pagesRootId))
+                return pagesRootId;
+        }
+
+        return null;
+    }
+
+    private static List<int> ResolvePageOrder(Dictionary<int, PdfObjectEntry> objects, int? catalogPagesRootId = null)
     {
         var pageSet = objects.Values
             .Where(o => PageTypeRegex().IsMatch(o.DictionaryText))
@@ -1835,12 +1976,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
 
         var ordered = new List<int>();
         var visitedNodes = new HashSet<int>();
-
-        var pagesRoots = objects.Values
-            .Where(o => PagesTypeRegex().IsMatch(o.DictionaryText))
-            .OrderBy(o => o.DictionaryText.Contains("/Parent", StringComparison.Ordinal) ? 1 : 0)
-            .ThenBy(o => o.ObjectNumber)
-            .ToList();
 
         void Traverse(int nodeId)
         {
@@ -1864,13 +1999,29 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
             }
         }
 
-        if (pagesRoots.Count > 0)
-            Traverse(pagesRoots[0].ObjectNumber);
-
-        foreach (int id in pageSet.OrderBy(x => x))
+        if (catalogPagesRootId.HasValue)
         {
-            if (!ordered.Contains(id))
-                ordered.Add(id);
+            Traverse(catalogPagesRootId.Value);
+        }
+        else
+        {
+            var pagesRoots = objects.Values
+                .Where(o => PagesTypeRegex().IsMatch(o.DictionaryText))
+                .OrderBy(o => o.DictionaryText.Contains("/Parent", StringComparison.Ordinal) ? 1 : 0)
+                .ThenBy(o => o.ObjectNumber)
+                .ToList();
+
+            if (pagesRoots.Count > 0)
+                Traverse(pagesRoots[0].ObjectNumber);
+        }
+
+        if (ordered.Count == 0)
+        {
+            foreach (int id in pageSet.OrderBy(x => x))
+            {
+                if (!ordered.Contains(id))
+                    ordered.Add(id);
+            }
         }
 
         return ordered;
@@ -2188,7 +2339,6 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
                             var c1 = TransformToTopLeft(cp[0], cp[1]);
                             var c2 = TransformToTopLeft(cp[2], cp[3]);
                             var endPt = TransformToTopLeft(cp[4], cp[5]);
-                            // Approximate Bezier curve using 3 chords for crisp rendering and accurate bounds
                             currentSegments.Add((curX, curY, (curX + c1.TopX) * 0.5, (curY + c1.TopY) * 0.5));
                             currentSegments.Add(((curX + c1.TopX) * 0.5, (curY + c1.TopY) * 0.5, (c2.TopX + endPt.TopX) * 0.5, (c2.TopY + endPt.TopY) * 0.5));
                             currentSegments.Add(((c2.TopX + endPt.TopX) * 0.5, (c2.TopY + endPt.TopY) * 0.5, endPt.TopX, endPt.TopY));
@@ -2602,7 +2752,7 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     private static bool TryParseDouble(string raw, out double val) =>
         double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out val);
 
-    private static bool HasPdfSignature(byte[] bytes)
+    private static bool HasPdfSignature(ReadOnlySpan<byte> bytes)
     {
         if (bytes.Length < 8) return false;
         int searchLen = Math.Min(bytes.Length - 5, 1024);
@@ -2617,11 +2767,20 @@ public sealed partial class HybridOnnxPdfIngestionEngine(
     private static string ComputeSha256Hex(byte[] bytes) =>
         Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
+    [GeneratedRegex(@"/Type\s*/Catalog\b", RegexOptions.Compiled)]
+    private static partial Regex CatalogTypeRegex();
+
     [GeneratedRegex(@"/Type\s*/Pages\b", RegexOptions.Compiled)]
     private static partial Regex PagesTypeRegex();
 
     [GeneratedRegex(@"/Type\s*/Page\b", RegexOptions.Compiled)]
     private static partial Regex PageTypeRegex();
+
+    [GeneratedRegex(@"/Root\s+(\d+)\s+\d+\s+R\b", RegexOptions.Compiled)]
+    private static partial Regex RootRefRegex();
+
+    [GeneratedRegex(@"/Pages\s+(\d+)\s+\d+\s+R\b", RegexOptions.Compiled)]
+    private static partial Regex PagesRefRegex();
 
     [GeneratedRegex(@"/Kids\s*\[(.*?)\]", RegexOptions.Singleline | RegexOptions.Compiled)]
     private static partial Regex KidsArrayRegex();

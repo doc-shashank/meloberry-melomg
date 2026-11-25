@@ -8,7 +8,7 @@ using Melomg.Domain.Extraction;
 
 namespace Melomg.Application.UseCases.Extraction;
 
-internal static class QaOverlayManifestHelper
+public static class QaOverlayManifestHelper
 {
     private const string ManifestFileName = ".qa_overlays";
 

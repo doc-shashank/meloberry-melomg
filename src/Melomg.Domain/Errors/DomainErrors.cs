@@ -79,6 +79,16 @@ public static class FigureErrors
             ErrorType.Conflict,
             Hint: $"Target explicitly using: {list}");
     }
+
+    public static Error SubPanelSelectionRequired(string query, IEnumerable<string> candidateAddresses)
+    {
+        string list = string.Join(", ", candidateAddresses);
+        return new Error(
+            "Figure.AmbiguousNumber",
+            $"Figure number '{query}' refers to sub-panel(s) rather than a standalone figure.",
+            ErrorType.Conflict,
+            Hint: $"Target explicitly using: {list}");
+    }
 }
 
 public static class ModelErrors

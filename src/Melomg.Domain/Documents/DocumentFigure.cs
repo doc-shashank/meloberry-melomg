@@ -117,20 +117,23 @@ public sealed class DocumentFigure : IIndexedEntity
         string? explicitPrefix, string? explicitNumber, string? caption, string? label)
     {
         string? prefix = string.IsNullOrWhiteSpace(explicitPrefix) ? null : explicitPrefix.Trim();
-        string? num = string.IsNullOrWhiteSpace(explicitNumber) ? null : explicitNumber.Trim();
-        string? shortLabel = null;
+        string? num = null;
+        if (!string.IsNullOrWhiteSpace(explicitNumber))
+        {
+            var (numPrefix, strippedNum) = FigureNumberNormalizer.ExtractLeadingPrefix(explicitNumber);
+            prefix ??= numPrefix;
+            num = strippedNum;
+        }
 
         if (FigureNumberNormalizer.TryParseFigureCaption(caption, out var capParsed))
         {
             prefix ??= capParsed.Prefix;
             num ??= capParsed.Number;
-            shortLabel = capParsed.ShortLabel;
         }
         else if (FigureNumberNormalizer.TryParseFigureCaption(label, out var lblParsed))
         {
             prefix ??= lblParsed.Prefix;
             num ??= lblParsed.Number;
-            shortLabel = lblParsed.ShortLabel;
         }
 
         string? norm = string.IsNullOrWhiteSpace(num) ? null : FigureNumberNormalizer.NormalizeLookupNumber(num);
@@ -139,6 +142,10 @@ public sealed class DocumentFigure : IIndexedEntity
             num = null;
             norm = null;
         }
+
+        string? shortLabel = !string.IsNullOrWhiteSpace(num)
+            ? (!string.IsNullOrWhiteSpace(prefix) ? $"{prefix} {num}" : num)
+            : null;
 
         return (prefix, num, norm, shortLabel);
     }
@@ -240,15 +247,17 @@ public sealed class DocumentFigure : IIndexedEntity
             return Result.Success();
         }
 
-        string trimmed = figureNumber.Trim();
-        string norm = FigureNumberNormalizer.NormalizeLookupNumber(trimmed);
+        var (extractedPrefix, strippedNum) = FigureNumberNormalizer.ExtractLeadingPrefix(figureNumber);
+        string norm = FigureNumberNormalizer.NormalizeLookupNumber(strippedNum);
         if (string.IsNullOrWhiteSpace(norm))
             return FigureErrors.InvalidFigureNumber(figureNumber);
 
         if (!string.IsNullOrWhiteSpace(vocabPrefix))
             VocabPrefix = vocabPrefix.Trim();
+        else if (!string.IsNullOrWhiteSpace(extractedPrefix) && string.IsNullOrWhiteSpace(VocabPrefix))
+            VocabPrefix = extractedPrefix;
 
-        FigureNumber = trimmed;
+        FigureNumber = strippedNum;
         NormalizedNumber = norm;
         return Result.Success();
     }
